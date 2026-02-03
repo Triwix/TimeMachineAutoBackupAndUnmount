@@ -1,123 +1,96 @@
-# macOS Time Machine Auto-Backup
+# Time Machine Auto-Backup
 
-Automatically triggers Time Machine backups when your backup disk is mounted, then ejects the disk when done.
-
-## Features
-
-- ✅ Runs automatically when Time Machine disk is mounted
-- ✅ Runs on login (catches cases where disk was plugged in while Mac was sleeping)
-- ✅ Only backs up if last backup is older than 3 days (configurable)
-- ✅ Ejects disk automatically after backup completes
-- ✅ Sends macOS notifications for backup completion and errors
-- ✅ Logs all activity to `~/Library/Logs/tm-auto-backup.log`
-
-## Requirements
-
-- macOS (tested on macOS 15.2+)
-- Time Machine already configured with a backup disk
-- Terminal with Full Disk Access (for `tmutil` commands)
+- Runs a backup when your Time Machine disk is mounted
+- Only backs up if it's been more than 3 days since the last backup
+- Automatically ejects the disk when done
+- Shows notifications for backup status
+- Logs all activity
 
 ## Installation
 
-### 1. Copy the script
-```bash
-mkdir -p ~/Library/Scripts
-curl -o ~/Library/Scripts/timemachine-auto.sh https://raw.githubusercontent.com/YOUR_USERNAME/macos-timemachine-auto-backup/main/timemachine-auto.sh
-chmod +x ~/Library/Scripts/timemachine-auto.sh
-```
+1. **Clone or download this repository**
+   ```bash
+   git clone https://github.com/Triwix/TimeMachineAutoBackupAndUnmount.git
+   cd timemachine-auto
+   ```
 
-### 2. Install the LaunchAgent
-```bash
-curl -o ~/Library/LaunchAgents/com.user.timemachine-auto.plist https://raw.githubusercontent.com/YOUR_USERNAME/macos-timemachine-auto-backup/main/com.user.timemachine-auto.plist
-```
+2. **Make the script executable**
+   ```bash
+   chmod +x timemachine-auto.sh
+   ```
 
-Edit the plist to replace `YOUR_USERNAME` with your actual username:
-```bash
-nano ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-```
+3. **Copy files to the correct locations**
+   ```bash
+   # Copy the script
+   cp timemachine-auto.sh ~/Library/Scripts/
+   
+   # Copy the LaunchAgent
+   cp com.user.timemachine-auto.plist ~/Library/LaunchAgents/
+   ```
 
-### 3. Grant Full Disk Access to Terminal
+4. **Update the plist file path**
+   
+   Open `~/Library/LaunchAgents/com.user.timemachine-auto.plist` and replace `YOUR_USERNAME` with your actual macOS username:
+   ```bash
+   # Quick way to do this:
+   sed -i '' "s/YOUR_USERNAME/$USER/g" ~/Library/LaunchAgents/com.user.timemachine-auto.plist
+   ```
 
-1. Go to **System Settings** > **Privacy & Security** > **Full Disk Access**
-2. Click the **+** button
-3. Navigate to **Applications > Utilities > Terminal** and add it
-
-### 4. Load the LaunchAgent
-```bash
-launchctl load ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-```
-
-### 5. Verify it's running
-```bash
-launchctl list | grep timemachine
-```
-
-You should see `com.user.timemachine-auto` in the output.
+5. **Load the LaunchAgent**
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.user.timemachine-auto.plist
+   ```
 
 ## Configuration
 
 Edit `~/Library/Scripts/timemachine-auto.sh` to change settings:
-```bash
-BACKUP_THRESHOLD_DAYS=3  # Change to 7 for weekly backups, 1 for daily, etc.
-```
 
-After changing settings, reload the LaunchAgent:
-```bash
-launchctl unload ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-launchctl load ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-```
+- `BACKUP_THRESHOLD_DAYS=3` - Minimum days between backups (default: 3)
 
 ## Usage
 
-Just plug in your Time Machine disk! The automation will:
+Once installed, the script runs automatically when:
+- Your Time Machine disk is mounted
+- You log in (if the disk is already connected)
 
-1. Detect when the disk is mounted
-2. Check if a backup is needed (based on `BACKUP_THRESHOLD_DAYS`)
-3. Run the backup if needed
-4. Eject the disk when done
+Just plug in your Time Machine backup disk and it will handle the rest!
 
 ## Logs
 
-View the log anytime:
+Check backup activity:
 ```bash
-cat ~/Library/Logs/tm-auto-backup.log
+tail -f ~/Library/Logs/AutoTMLogs/tm-auto-backup.log
 ```
 
-Or use Console.app and search for "tm-auto-backup"
+## Uninstall
+
+```bash
+# Stop the service
+launchctl unload ~/Library/LaunchAgents/com.user.timemachine-auto.plist
+
+# Remove files
+rm ~/Library/LaunchAgents/com.user.timemachine-auto.plist
+rm ~/Library/Scripts/timemachine-auto.sh
+rm -rf ~/Library/Logs/AutoTMLogs/
+```
 
 ## Troubleshooting
 
-### Script not running
+**Script not running?**
+- Check if the LaunchAgent is loaded: `launchctl list | grep timemachine`
+- Verify the script path in the plist file matches your username
+- Check logs for errors: `cat ~/Library/Logs/AutoTMLogs/tm-auto-backup.log`
+- Full-Disk Access for Terminal might be needed.
 
-Check if LaunchAgent is loaded:
-```bash
-launchctl list | grep timemachine
-```
+**Disk not ejecting?**
+- The disk may still be in use by another application
+- Check the logs to see if Time Machine completed successfully
 
-Check error logs:
-```bash
-cat ~/Library/Logs/tm-launchd-err.log
-```
+## Requirements
 
-### Permission errors
-
-Make sure Terminal has Full Disk Access (see Installation step 3)
-
-### Disk not ejecting
-
-Check if other apps are using the disk. The script will retry 3 times and send a notification if ejection fails.
-
-## Uninstall
-```bash
-launchctl unload ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-rm ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-rm ~/Library/Scripts/timemachine-auto.sh
-```
+- macOS with Time Machine configured
+- Time Machine backup disk
 
 ## License
 
-MIT License - see LICENSE file
-
-## Contributing
-
-Pull requests welcome! Feel free to open issues for bugs or feature requests.
+MIT
