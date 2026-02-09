@@ -2,20 +2,37 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!-- Manage this agent from Terminal:
+         Load:   launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
+         Unload: launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
+         Start now once (optional): launchctl kickstart -k "gui/$(id -u)/com.user.timemachine-auto"
+         Note: kickstart is a one-time immediate run/restart; recurring runs still come from StartOnMount/RunAtLoad.
+    -->
+
+    <!-- Label: unique identifier for this LaunchAgent. -->
     <key>Label</key>
     <string>com.user.timemachine-auto</string>
+
+    <!-- ProgramArguments: use $HOME at runtime so this works across user accounts. -->
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/YOUR_USERNAME/Library/Scripts/timemachine-auto.sh</string>
+        <string>-c</string>
+        <string>exec "$HOME/Library/Scripts/timemachine-auto.sh"</string>
     </array>
+
+    <!-- StartOnMount: run when any volume mounts. -->
     <key>StartOnMount</key>
     <true/>
+
+    <!-- RunAtLoad: run at login/agent load. -->
     <key>RunAtLoad</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>/Users/YOUR_USERNAME/Library/Logs/AutoTMLogs/tm-launchd-out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/YOUR_USERNAME/Library/Logs/AutoTMLogs/tm-launchd-err.log</string>
+
+    <!-- StartInterval: periodic safety run (30 minutes) in case a backup finishes without a new mount event. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Script writes to $HOME/Library/Logs/AutoTMLogs/tm-auto-backup.log -->
 </dict>
 </plist>
