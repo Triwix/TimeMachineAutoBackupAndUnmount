@@ -1,113 +1,373 @@
 # Time Machine Auto-Backup
 
-- Runs a backup when your Time Machine disk is mounted
-- Only backs up if it's been more than 3 days since the last backup (configurable)
-- Automatically ejects the disk when done
-- Shows notifications for backup status
-- Logs all activity
+> **Automatically backup to Time Machine when your external disk is plugged in, then safely eject when done.**
 
-## Files
-1. timemachine-auto.sh -- This is the logic that handles whether or not to backup, and eject the time machine disk.
-3. com.user.timemachine-auto.plist -- This file defines the triggers to run the script (login or disk mount).
+Stop worrying about whether you remembered to backup or safely eject your Time Machine disk. This script handles it automatically—just plug in your backup drive and let it work.
 
+[![macOS](https://img.shields.io/badge/macOS-26.2+-blue.svg)](https://www.apple.com/macos/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-## Installation
+---
 
-1. **Clone or download this repository**
+## ✨ Features
 
-2. **Make the script executable**
-   ```bash
-   chmod +x timemachine-auto.sh
-   ```
-   
-3. **Update the plist file path**
-   
-   Open `com.user.timemachine-auto.plist` and replace `YOUR_USERNAME` with your actual macOS username in all three locations for proper log functionality.
-   
-4. **Copy files to the correct locations**
-   ```bash
-   # Copy the script
-   cp timemachine-auto.sh ~/Library/Scripts/
-   
-   # Copy the LaunchAgent
-   cp com.user.timemachine-auto.plist ~/Library/LaunchAgents/
-   ```
-   
-5. **Load the LaunchAgent**
-   ```bash
-   launchctl load ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-   ```
-   The script `timemachine-auto.sh` will now execute automatically
+### Core Functionality
+- **🔌 Plug & Forget**: Automatically detects when Time Machine disk is mounted
+- **⚡ Smart Backups**: Only backs up when threshold time has elapsed (default: 72 hours)
+- **🎯 Auto-Eject**: Safely ejects disk after backup completes (or immediately if no backup needed)
+- **🔒 Single-Instance**: Prevents multiple simultaneous runs with intelligent lock mechanism
+- **💪 Resilient**: Handles interrupted backups, disk unplugging, and edge cases gracefully
 
-   To disable the LaunchAgent:
-   ```bash
-   launchctl unload ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-   ```
+### Advanced Features
+- **🎨 Menu Bar Icon**: Optionally shows Time Machine icon during active backups
+- **📊 Smart Scheduling**: Fallback to timestamp-based scheduling if backup history unavailable
+- **🔄 Conflict Resolution**: Waits for user-initiated backups to complete before proceeding
+- **⚙️ Multi-Destination Support**: Can target specific backup disk via UUID (required if you have multiple)
+- **📝 Comprehensive Logging**: Automatic log rotation with configurable size limits
+- **🛡️ Full Disk Access Handling**: Graceful degradation when FDA is missing
 
-## Configuration
+---
 
-Edit `~/Library/Scripts/timemachine-auto.sh` to change settings:
+## 📋 Requirements
 
-- `BACKUP_THRESHOLD_DAYS=3` - Minimum days between backups (default: 3)
+- **macOS 10.13+** (High Sierra or later)
+- **Time Machine** configured with a local backup destination
+- **Full Disk Access** (optional but recommended for best reliability)
 
-## Usage
+> **Note**: Network Time Machine destinations (SMB/AFP) are not currently supported.
 
-Once installed, the script runs automatically when either occurs:
-- Your Time Machine disk is mounted
-- You log in (if the disk is already connected)
+---
 
-Just plug in your Time Machine backup disk and it will handle the rest!
+## 🚀 Quick Start
 
-## How It Works
-
-1. Script waits 5 seconds for disk to fully mount
-2. Checks if Time Machine destination is available
-3. Gets the last backup timestamp from the backup folder name
-4. Compares against threshold (default: 3 days)
-5. Runs backup if needed (or skips if recent)
-6. Ejects disk automatically
-7. Sends notifications for completion/errors
-
-## Logs
-
-Log Location: ~/Library/Logs/AutoTMLogs/tm-auto-backup.log
-
-Check backup activity by opening the log file, checking tm-auto-backup.log in the Console app, or through Terminal with:
+### 1. Install the Script
 
 ```bash
-tail -f ~/Library/Logs/AutoTMLogs/tm-auto-backup.log
+# Create directories
+mkdir -p "$HOME/Library/Scripts"
+mkdir -p "$HOME/Library/LaunchAgents"
+
+# Download and install the script
+curl -O https://raw.githubusercontent.com/YOUR_USERNAME/timemachine-auto/main/timemachine-auto.sh
+mv timemachine-auto.sh "$HOME/Library/Scripts/"
+chmod +x "$HOME/Library/Scripts/timemachine-auto.sh"
+
+# Download and install the launchd agent
+curl -O https://raw.githubusercontent.com/YOUR_USERNAME/timemachine-auto/main/com.user.timemachine-auto.plist
+mv com.user.timemachine-auto.plist "$HOME/Library/LaunchAgents/"
 ```
 
-## Uninstall
+### 2. Grant Full Disk Access (Recommended)
+
+1. Open **System Settings** → **Privacy & Security** → **Full Disk Access**
+2. Click the **+** button
+3. Navigate to `/bin/bash` and add it
+4. Alternatively, add your terminal emulator (Terminal.app, iTerm, etc.)
+
+> Without Full Disk Access, the script will still work using fallback scheduling, but won't be able to read backup history directly.
+
+### 3. Load the Agent
 
 ```bash
-# Stop the service
-launchctl unload ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-
-# Remove files
-rm ~/Library/LaunchAgents/com.user.timemachine-auto.plist
-rm ~/Library/Scripts/timemachine-auto.sh
-rm -rf ~/Library/Logs/AutoTMLogs/
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
 ```
 
-## Troubleshooting
+### 4. Test It
 
-**Script not running?**
-- Verify Time Machine is configured and the disk is currently mounted.
-- Check if the LaunchAgent is loaded: `launchctl list | grep timemachine`
-- Verify the script path in the plist file matches your username
-- Check logs for errors: `cat ~/Library/Logs/AutoTMLogs/tm-auto-backup.log`
-- Full-Disk Access for Terminal might be needed.
+```bash
+# Plug in your Time Machine disk and watch the log:
+tail -f "$HOME/Library/Logs/AutoTMLogs/tm-auto-backup.log"
 
-**Disk not ejecting?**
-- The disk may still be in use by another application
-- Check the logs to see if Time Machine completed successfully
+# Or trigger manually:
+launchctl kickstart -k "gui/$(id -u)/com.user.timemachine-auto"
+```
 
-## Requirements
+---
 
-- macOS with Time Machine configured
-- Time Machine backup disk
+## ⚙️ Configuration
 
-## License
+Edit `~/Library/Scripts/timemachine-auto.sh` to customize behavior:
 
-MIT
+### Basic Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `BACKUP_THRESHOLD_HOURS` | `72` | Minimum hours between backups (72 = 3 days) |
+| `EJECT_WHEN_NO_BACKUP` | `true` | Auto-eject disk if backup not needed |
+| `SHOW_MENUBAR_ICON_DURING_BACKUP` | `true` | Show Time Machine icon during backup |
+| `ALLOW_AUTOMOUNT` | `false` | Attempt to mount unmounted TM disks |
+
+### Advanced Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `PREFERRED_DESTINATION_ID` | `""` | Target specific backup disk UUID (required if you have multiple) |
+| `REQUIRE_SNAPSHOT_VERIFICATION` | `false` | Verify new snapshot before ejecting |
+| `BACKUP_BLOCK_TIMEOUT_SECONDS` | `14400` | Max backup duration (4 hours) |
+| `EJECT_RETRY_ATTEMPTS` | `3` | Number of eject retries |
+| `DUPLICATE_WINDOW_SECONDS` | `120` | Ignore duplicate triggers within this time |
+
+### Finding Your Destination UUID
+
+If you have multiple Time Machine destinations:
+
+```bash
+tmutil destinationinfo -X | grep -A1 "ID"
+```
+
+Copy the UUID and set it in the script:
+```bash
+PREFERRED_DESTINATION_ID="YOUR-UUID-HERE"
+```
+
+---
+
+## 📖 How It Works
+
+### Automatic Triggers
+
+The script runs automatically when:
+1. **Any volume mounts** (`StartOnMount` in launchd)
+2. **User logs in** (`RunAtLoad` in launchd)
+3. **Every 30 minutes** as a safety check (`StartInterval` in launchd)
+
+### Decision Flow
+
+```
+Disk Mounted
+    ↓
+Is it a Time Machine disk?
+    ↓ Yes
+Was backup done recently? (< BACKUP_THRESHOLD_HOURS)
+    ↓ No
+Start Time Machine backup
+    ↓
+Wait for completion (with timeout)
+    ↓
+Backup successful?
+    ↓ Yes
+Eject disk safely
+    ↓
+Done ✓
+```
+
+If backup not needed, disk is ejected immediately (unless `EJECT_WHEN_NO_BACKUP=false`).
+
+### Safety Features
+
+- **Single-instance lock**: Prevents overlapping runs
+- **Backup timeout**: Won't wait indefinitely (default: 4 hours)
+- **Eject verification**: Confirms disk is actually ejected
+- **Conflict detection**: Waits for user-initiated backups
+- **Duplicate suppression**: Won't re-process same mount multiple times
+- **State persistence**: Remembers last backup across runs
+
+---
+
+## 🔧 Management Commands
+
+### Check Status
+```bash
+launchctl print "gui/$(id -u)/com.user.timemachine-auto"
+```
+
+### View Logs
+```bash
+# Real-time
+tail -f "$HOME/Library/Logs/AutoTMLogs/tm-auto-backup.log"
+
+# Recent entries
+tail -50 "$HOME/Library/Logs/AutoTMLogs/tm-auto-backup.log"
+```
+
+### Manual Trigger
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.user.timemachine-auto"
+```
+
+### Disable Temporarily
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
+```
+
+### Re-enable
+```bash
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
+```
+
+### Run Manually (for debugging)
+```bash
+"$HOME/Library/Scripts/timemachine-auto.sh"
+```
+
+---
+
+## 🗑️ Uninstall
+
+```bash
+# 1. Stop and remove the agent
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
+
+# 2. Remove files
+rm -f "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
+rm -f "$HOME/Library/Scripts/timemachine-auto.sh"
+
+# 3. Remove state and logs (optional)
+rm -rf "$HOME/Library/Application Support/TimeMachineAuto"
+rm -rf "$HOME/Library/Caches/com.user.timemachine-auto.lock"
+rm -rf "$HOME/Library/Logs/AutoTMLogs"
+```
+
+---
+
+## 🐛 Troubleshooting
+
+### Script Not Running
+
+**Check if agent is loaded:**
+```bash
+launchctl print "gui/$(id -u)/com.user.timemachine-auto"
+```
+
+If not loaded, bootstrap it:
+```bash
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
+```
+
+### Disk Not Ejecting
+
+**Check logs for errors:**
+```bash
+tail -50 "$HOME/Library/Logs/AutoTMLogs/tm-auto-backup.log"
+```
+
+**Common causes:**
+- Finder window open to the disk
+- Files on disk in use by another app
+- Backup still running
+
+**Force re-attempt:**
+Close all windows/apps using the disk, then:
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.user.timemachine-auto"
+```
+
+### Backup Not Starting
+
+**Verify Time Machine is configured:**
+```bash
+tmutil destinationinfo
+```
+
+**Check Full Disk Access:**
+System Settings → Privacy & Security → Full Disk Access → Add `/bin/bash`
+
+### Multiple Destination Warning
+
+If you have multiple Time Machine disks, set `PREFERRED_DESTINATION_ID`:
+
+```bash
+# Find your UUID
+tmutil destinationinfo -X | grep -A1 "ID"
+
+# Edit script
+nano "$HOME/Library/Scripts/timemachine-auto.sh"
+# Set: PREFERRED_DESTINATION_ID="YOUR-UUID-HERE"
+```
+
+### Menu Icon Not Appearing
+
+The script tries multiple paths for the Time Machine menu extra. If none work on your macOS version:
+```bash
+# Disable the feature
+nano "$HOME/Library/Scripts/timemachine-auto.sh"
+# Set: SHOW_MENUBAR_ICON_DURING_BACKUP=false
+```
+
+---
+
+## 📊 Log File Locations
+
+| File | Purpose |
+|------|---------|
+| `~/Library/Logs/AutoTMLogs/tm-auto-backup.log` | Main log file |
+| `~/Library/Logs/AutoTMLogs/tm-auto-backup.log.1` | Previous log (rotated) |
+| `~/Library/Application Support/TimeMachineAuto/` | State files |
+| `~/Library/Caches/com.user.timemachine-auto.lock/` | Lock files |
+
+Logs automatically rotate when they exceed 5 MB (configurable via `MAX_LOG_BYTES`).
+
+---
+
+## ⚡ Performance Impact
+
+- **CPU**: Negligible (only active during mount events and 30-min checks)
+- **Battery**: Minimal (smart fast-path exits immediately for non-TM mounts)
+- **Disk**: Only writes to log file and small state files
+- **Network**: None (local operations only)
+
+The script is designed to be extremely lightweight and exit quickly when nothing needs to be done.
+
+---
+
+## 🔒 Security & Privacy
+
+- **No network communication**: All operations are local
+- **No data collection**: Script doesn't send data anywhere
+- **Minimal permissions**: Only needs Full Disk Access for `tmutil` commands
+- **Open source**: Fully auditable code
+- **Sandboxed**: Runs in user context, not as root
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+### Development
+
+**Run with debug output:**
+```bash
+set -x  # Enable bash debug mode
+"$HOME/Library/Scripts/timemachine-auto.sh"
+set +x
+```
+
+**Test without launchd:**
+```bash
+# Direct execution
+"$HOME/Library/Scripts/timemachine-auto.sh"
+
+# Check exit code
+echo $?
+```
+
+---
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 🙏 Acknowledgments
+
+- Built for macOS using native `tmutil`, `diskutil`, and `launchd`
+- Inspired by the need for safer, automatic Time Machine workflows
+- Thanks to the macOS automation community
+
+---
+
+## ⚠️ Disclaimer
+
+This script automates Time Machine backups and disk ejection. While extensively tested, use at your own risk. Always maintain multiple backups of important data. The authors are not responsible for data loss.
+
+---
+
+**Made with ❤️ for the macOS community**
