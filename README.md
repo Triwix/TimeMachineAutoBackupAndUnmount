@@ -1,5 +1,9 @@
 # Time Machine Auto-Unmount After Backup Automation
 
+When a time machine (tm) disk is mounted, an automation is triggered to ask tm if a backup is due per the backup freqeuncy set in macOS's native tm settings, unmounts the disk if unneeded, and if needed, backs up and then unmounts. The purpose of this automation is due to my need for regular backups on my macbook which I also use as desktop via a thunderbolt dock with a tm disk connected to it. However, I didn't want to think about having to unmount everytime I unplug the dock's cable from the macbook, hence, AutoUnmountTimeMachine was born.
+
+Built with love (and GPT-5.3-Codex Extra High) ❤️
+
 Behavior:
 - `launchd` triggers a script on login and any volume mount.
 - The script asks macOS to decide backup timing with `tmutil startbackup --auto --block`.
@@ -9,7 +13,7 @@ Behavior:
 ## Requirements
 - macOS 10.13 (High Sierra) or later
 - Time Machine already configured with at least one local destination
-- Full Disk Access granted to the process running the script (feel free to audit it!)
+- Full Disk Access granted to the process running the script (see notes below for more on how and why)
 - Script runs as a per-user LaunchAgent (not a daemon)
 
 ## Install
@@ -73,11 +77,12 @@ launchctl enable "gui/$(id -u)"/com.user.timemachine-auto
 ```
 </details>
 
-## Things to Note
+## Things to be aware of
 #### Full Disk Access
 - Grant Full Disk Access in System Settings -> Privacy & Security -> Full Disk Access. Add entries based on how you run the script:
   - Manual runs: add your terminal app (Terminal, iTerm, etc.).
   - Automatic LaunchAgent runs: add `/bin/bash` (the .plist runs the script through `/bin/bash`).
+- I know this sounds scary, but I couldn't find a way to get it to work right without it, feel free to audit both scripts for safety!
 - After adding entries:
   - Ensure each toggle is ON.
   - Quit and reopen the added app(s).
