@@ -1,293 +1,111 @@
 #!/bin/bash
 
-# Time Machine Auto-Backup Script
-# Automatically backs up when Time Machine disk is mounted
-# macOS-only script (uses tmutil, diskutil, launchd, BSD date/stat)
+# Time Machine Auto-Backup v3 (lightweight)
 #
-# Configuration:
-# - Runs on disk mount and at login
-# - Logs to: ~/Library/Logs/AutoTMLogs/tm-auto-backup.log
-# - Safe to tune: BACKUP_THRESHOLD_HOURS, EJECT_WHEN_NO_BACKUP, SHOW_MENUBAR_ICON_DURING_BACKUP
-# - Advanced tuning: WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS, BACKUP_BLOCK_TIMEOUT_SECONDS, LOCK_STALE_SECONDS
+# Behavior:
+# - Triggered by launchd on mount/login.
+# - Uses macOS-native backup timing via: tmutil startbackup --auto --block.
+# - If a backup is already running, waits for completion.
+# - Unmounts the Time Machine disk afterward.
+# - If macOS does not start a backup, unmounts immediately.
 #
-# To disable:
-# launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
-# To enable:
-# launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
+# Notes:
+# - This script only targets Local Time Machine destinations.
+# - Designed for single-destination setups (one local Time Machine disk).
+# - launchd StartOnMount triggers for all volume mounts; script exits fast when TM disk is absent.
+# - Backup frequency comes from Time Machine settings (hourly/daily/weekly retention policy).
+# - LaunchAgent commands:
+#   unload: launchctl bootout "gui/$(id -u)"/com.user.timemachine-auto 2>/dev/null || true
+#   load:   launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist" && launchctl enable "gui/$(id -u)"/com.user.timemachine-auto
 #
-# Troubleshooting:
-# - Agent status: launchctl print "gui/$(id -u)/com.user.timemachine-auto"
-# - Trigger once now: launchctl kickstart -k "gui/$(id -u)/com.user.timemachine-auto"
-# - Manual run: "$HOME/Library/Scripts/timemachine-auto.sh"
-# - Destination check: tmutil destinationinfo -X
-# - If you see Full Disk Access warnings, grant FDA to the app/shell hosting this agent context.
-#
-# Uninstall cleanup:
-# 1) launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
-# 2) rm -f "$HOME/Library/LaunchAgents/com.user.timemachine-auto.plist"
-# 3) rm -f "$HOME/Library/Scripts/timemachine-auto.sh"
-# 4) rm -rf "$HOME/Library/Application Support/TimeMachineAuto" "$HOME/Library/Caches/com.user.timemachine-auto.lock" "$HOME/Library/Logs/AutoTMLogs"
+# -------------------------------------------------------------------------
 
-# User configuration
-# BACKUP_THRESHOLD_HOURS: Minimum hours between backups. Example: 24 for daily.
-# DUPLICATE_WINDOW_SECONDS: Ignore repeated triggers within this many seconds.
-# ALLOW_AUTOMOUNT: If true, attempt to mount the TM disk when connected but unmounted.
-# EJECT_WHEN_NO_BACKUP: If false, keep disk mounted when no backup is needed.
-# SHOW_MENUBAR_ICON_DURING_BACKUP: If true, temporarily show TM menu icon while this script runs a backup.
-#   Note: this may restart SystemUIServer when restoring the original menu icon state.
-# REQUIRE_SNAPSHOT_VERIFICATION: If true, require a new snapshot ID before ejecting after backup.
-# FDA_NOTIFY_COOLDOWN_SECONDS: Minimum interval between Full Disk Access alerts.
-# EJECT_RETRY_ATTEMPTS: Number of eject retries when initial attempt fails.
-# RUNNING_BACKUP_POLL_SECONDS: Poll interval while waiting for an already-running backup to finish.
-# WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS: Max wait time for an already-running backup before leaving mounted.
-# LOCK_STALE_SECONDS: If lock PID is missing/invalid and older than this, reclaim lock.
-# PREFERRED_DESTINATION_ID: Optional Time Machine destination UUID to target explicitly.
-# MAX_LOG_BYTES: Rotate log file when it exceeds this size in bytes.
-# MAX_LOG_FILES: Number of rotated logs to keep.
-# FAST_PATH_WAIT_SECONDS: Grace period for tmutil to surface a newly mounted destination.
-# MAX_FALLBACK_STATE_AGE_HOURS: If fallback state is older than this, force a backup attempt.
-# BACKUP_BLOCK_TIMEOUT_SECONDS: Maximum time to wait for started backup activity to complete.
-# EJECT_PRECHECK_DELAY_SECONDS: Delay before eject precheck after backup/no-backup decision.
-# MAX_LOCK_PID_WAIT_SECONDS: If lock has no PID and is newer than this, assume setup race and defer.
-# LOG_FILE: Script log file; directory is created automatically.
-# LOCK_DIR: Single-instance lock directory.
-# STATE_FILE: Stores last handled mount signature/time.
-# LAST_SUCCESS_FILE: Stores the epoch of the last successful backup run (destination-scoped at runtime).
-# FDA_NOTICE_FILE: Stores the epoch of the last Full Disk Access notification.
-# PATH: Command lookup for launchd; include system bins needed by the script.
-BACKUP_THRESHOLD_HOURS=72
-DUPLICATE_WINDOW_SECONDS=120
-ALLOW_AUTOMOUNT=false
-EJECT_WHEN_NO_BACKUP=true
-SHOW_MENUBAR_ICON_DURING_BACKUP=true
-REQUIRE_SNAPSHOT_VERIFICATION=false
-FDA_NOTIFY_COOLDOWN_SECONDS=86400
-EJECT_RETRY_ATTEMPTS=3
-RUNNING_BACKUP_POLL_SECONDS=15
-WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS=7200
-LOCK_STALE_SECONDS=1200
+# User configuration:
+
+# Optional destination UUID. Leave empty to auto-select when exactly one local destination is configured.
 PREFERRED_DESTINATION_ID=""
-MAX_LOG_BYTES=5242880
-MAX_LOG_FILES=5
-FAST_PATH_WAIT_SECONDS=15
-MAX_FALLBACK_STATE_AGE_HOURS=336
-BACKUP_BLOCK_TIMEOUT_SECONDS=14400
-EJECT_PRECHECK_DELAY_SECONDS=3
-MAX_LOCK_PID_WAIT_SECONDS=5
-STATE_DIR="$HOME/Library/Application Support/TimeMachineAuto"
-LOG_FILE="$HOME/Library/Logs/AutoTMLogs/tm-auto-backup.log"
-LOCK_DIR="$HOME/Library/Caches/com.user.timemachine-auto.lock"
+
+# Poll interval while checking backup status.
+BACKUP_POLL_SECONDS=15
+
+# Maximum total wait for an active backup before leaving disk mounted.
+BACKUP_MAX_WAIT_SECONDS=43200
+
+# Delay after backup completes before unmount, to let final I/O settle.
+POST_BACKUP_SETTLE_SECONDS=10
+
+# Number of unmount retries before failure.
+UNMOUNT_RETRY_ATTEMPTS=3
+
+# Lock age threshold before a stale lock is reclaimed.
+LOCK_STALE_SECONDS=21600
+
+# How often to refresh lock metadata while waiting in long-running loops.
+LOCK_REFRESH_SECONDS=600
+
+# -------------------------------------------------------------------------
+
+# Backward compatibility with previous config name.
+if [ -n "${EJECT_RETRY_ATTEMPTS:-}" ]; then
+    UNMOUNT_RETRY_ATTEMPTS="$EJECT_RETRY_ATTEMPTS"
+fi
+
+# Directory for persistent script state.
+STATE_DIR="$HOME/Library/Application Support/TimeMachineAutoV3"
+# Log destination file.
+LOG_FILE="$HOME/Library/Logs/AutoTMLogs/tm-auto-backup-v3.log"
+# Lock directory used for single-instance execution.
+LOCK_DIR="$HOME/Library/Caches/com.user.timemachine-auto-v3.lock"
+# File storing last processed mount signature + timestamp.
 STATE_FILE="$STATE_DIR/last-processed-mount.state"
-LEGACY_LAST_SUCCESS_FILE="$STATE_DIR/last-successful-backup.epoch"
-LAST_SUCCESS_FILE="$LEGACY_LAST_SUCCESS_FILE"
-FDA_NOTICE_FILE="$STATE_DIR/last-fda-notice.epoch"
-TM_MENU_STATE_FILE="$STATE_DIR/tm-menu-icon-added.marker"
-TM_MENU_PATH_NOTICE_FILE="$STATE_DIR/tm-menu-path-warning.marker"
+
+# Explicit PATH for launchd context.
 PATH="/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+# Stable locale to avoid parsing issues.
 LC_ALL="C"
 LANG="C"
-TIME_MACHINE_MENU_EXTRA="/System/Library/CoreServices/Menu Extras/TimeMachine.menu"
-TIME_MACHINE_MENU_CANDIDATES=(
-    "/System/Library/CoreServices/Menu Extras/TimeMachine.menu"
-    "/System/Library/CoreServices/MenuExtras/TimeMachine.menu"
-    "/Applications/Utilities/Time Machine.app/Contents/Resources/TimeMachine.menu"
-)
-TM_MENU_ICON_ADDED_BY_SCRIPT=false
-LOCK_PID_FILE="$LOCK_DIR/pid"
-LOCK_CREATED_FILE="$LOCK_DIR/created_epoch"
-LOCK_CMD_FILE="$LOCK_DIR/cmdline"
-LOCK_START_FILE="$LOCK_DIR/start_key"
-
-# Create log directory if it doesn't exist
-mkdir -p "$(dirname "$LOG_FILE")"
-mkdir -p "$(dirname "$STATE_FILE")"
-mkdir -p "$(dirname "$LOCK_DIR")"
-mkdir -p "$(dirname "$TM_MENU_STATE_FILE")"
 export PATH LC_ALL LANG
 
-validate_numeric_configs() {
-    local had_invalid_config=false
+# Lock metadata files stored inside LOCK_DIR.
+LOCK_PID_FILE="$LOCK_DIR/pid"
+LOCK_CREATED_FILE="$LOCK_DIR/created_epoch"
 
-    if ! [[ "$BACKUP_THRESHOLD_HOURS" =~ ^[0-9]+$ ]] || [ "$BACKUP_THRESHOLD_HOURS" -lt 1 ]; then
-        log "WARNING: Invalid BACKUP_THRESHOLD_HOURS ($BACKUP_THRESHOLD_HOURS); using default 72"
-        BACKUP_THRESHOLD_HOURS=72
-        had_invalid_config=true
-    fi
-    if ! [[ "$DUPLICATE_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || [ "$DUPLICATE_WINDOW_SECONDS" -lt 0 ]; then
-        log "WARNING: Invalid DUPLICATE_WINDOW_SECONDS ($DUPLICATE_WINDOW_SECONDS); using default 120"
-        DUPLICATE_WINDOW_SECONDS=120
-        had_invalid_config=true
-    fi
-    if ! [[ "$FDA_NOTIFY_COOLDOWN_SECONDS" =~ ^[0-9]+$ ]] || [ "$FDA_NOTIFY_COOLDOWN_SECONDS" -lt 0 ]; then
-        log "WARNING: Invalid FDA_NOTIFY_COOLDOWN_SECONDS ($FDA_NOTIFY_COOLDOWN_SECONDS); using default 86400"
-        FDA_NOTIFY_COOLDOWN_SECONDS=86400
-        had_invalid_config=true
-    fi
-    if ! [[ "$EJECT_RETRY_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$EJECT_RETRY_ATTEMPTS" -lt 1 ]; then
-        log "WARNING: Invalid EJECT_RETRY_ATTEMPTS ($EJECT_RETRY_ATTEMPTS); using default 3"
-        EJECT_RETRY_ATTEMPTS=3
-        had_invalid_config=true
-    fi
-    if ! [[ "$RUNNING_BACKUP_POLL_SECONDS" =~ ^[0-9]+$ ]] || [ "$RUNNING_BACKUP_POLL_SECONDS" -lt 1 ]; then
-        log "WARNING: Invalid RUNNING_BACKUP_POLL_SECONDS ($RUNNING_BACKUP_POLL_SECONDS); using default 15"
-        RUNNING_BACKUP_POLL_SECONDS=15
-        had_invalid_config=true
-    fi
-    if ! [[ "$WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS" =~ ^[0-9]+$ ]] || [ "$WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS" -lt "$RUNNING_BACKUP_POLL_SECONDS" ]; then
-        log "WARNING: Invalid WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS ($WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS); using default 7200"
-        WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS=7200
-        had_invalid_config=true
-    fi
-    if ! [[ "$LOCK_STALE_SECONDS" =~ ^[0-9]+$ ]] || [ "$LOCK_STALE_SECONDS" -lt 1 ]; then
-        log "WARNING: Invalid LOCK_STALE_SECONDS ($LOCK_STALE_SECONDS); using default 1200"
-        LOCK_STALE_SECONDS=1200
-        had_invalid_config=true
-    fi
-    if ! [[ "$FAST_PATH_WAIT_SECONDS" =~ ^[0-9]+$ ]] || [ "$FAST_PATH_WAIT_SECONDS" -lt 1 ]; then
-        log "WARNING: Invalid FAST_PATH_WAIT_SECONDS ($FAST_PATH_WAIT_SECONDS); using default 15"
-        FAST_PATH_WAIT_SECONDS=15
-        had_invalid_config=true
-    fi
-    if ! [[ "$MAX_FALLBACK_STATE_AGE_HOURS" =~ ^[0-9]+$ ]] || [ "$MAX_FALLBACK_STATE_AGE_HOURS" -lt 1 ]; then
-        log "WARNING: Invalid MAX_FALLBACK_STATE_AGE_HOURS ($MAX_FALLBACK_STATE_AGE_HOURS); using default 336"
-        MAX_FALLBACK_STATE_AGE_HOURS=336
-        had_invalid_config=true
-    fi
-    if ! [[ "$BACKUP_BLOCK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [ "$BACKUP_BLOCK_TIMEOUT_SECONDS" -lt 60 ]; then
-        log "WARNING: Invalid BACKUP_BLOCK_TIMEOUT_SECONDS ($BACKUP_BLOCK_TIMEOUT_SECONDS); using default 14400"
-        BACKUP_BLOCK_TIMEOUT_SECONDS=14400
-        had_invalid_config=true
-    fi
-    if ! [[ "$EJECT_PRECHECK_DELAY_SECONDS" =~ ^[0-9]+$ ]] || [ "$EJECT_PRECHECK_DELAY_SECONDS" -lt 0 ]; then
-        log "WARNING: Invalid EJECT_PRECHECK_DELAY_SECONDS ($EJECT_PRECHECK_DELAY_SECONDS); using default 3"
-        EJECT_PRECHECK_DELAY_SECONDS=3
-        had_invalid_config=true
-    fi
-    if ! [[ "$MAX_LOCK_PID_WAIT_SECONDS" =~ ^[0-9]+$ ]] || [ "$MAX_LOCK_PID_WAIT_SECONDS" -lt 0 ]; then
-        log "WARNING: Invalid MAX_LOCK_PID_WAIT_SECONDS ($MAX_LOCK_PID_WAIT_SECONDS); using default 5"
-        MAX_LOCK_PID_WAIT_SECONDS=5
-        had_invalid_config=true
-    fi
-    if ! [[ "$MAX_LOG_BYTES" =~ ^[0-9]+$ ]] || [ "$MAX_LOG_BYTES" -lt 0 ]; then
-        log "WARNING: Invalid MAX_LOG_BYTES ($MAX_LOG_BYTES); using default 5242880"
-        MAX_LOG_BYTES=5242880
-        had_invalid_config=true
-    fi
-    if ! [[ "$MAX_LOG_FILES" =~ ^[0-9]+$ ]] || [ "$MAX_LOG_FILES" -lt 0 ]; then
-        log "WARNING: Invalid MAX_LOG_FILES ($MAX_LOG_FILES); using default 5"
-        MAX_LOG_FILES=5
-        had_invalid_config=true
-    fi
+mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$STATE_DIR"
+mkdir -p "$(dirname "$LOCK_DIR")"
 
-    if [ "$had_invalid_config" = true ]; then
-        log "One or more invalid numeric config values were corrected to defaults"
-    fi
+log() {
+    rotate_log_if_needed
+    printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
 }
 
-normalize_bool() {
-    local raw normalized default_value
-    raw="$1"
-    default_value="$2"
-    normalized=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
-    case "$normalized" in
-        true|1|yes|on)
-            printf 'true\n'
-            ;;
-        false|0|no|off)
-            printf 'false\n'
-            ;;
-        *)
-            printf '%s\n' "$default_value"
-            ;;
-    esac
-}
+rotate_log_if_needed() {
+    # Rotate when log reaches 1 MiB.
+    local max_bytes=1048576
+    # Keep up to 3 rotated logs: .1, .2, .3
+    local keep_count=3
+    local size
+    local idx
 
-is_valid_bool_literal() {
-    local normalized
-    normalized=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-    case "$normalized" in
-        true|1|yes|on|false|0|no|off)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
+    [ -f "$LOG_FILE" ] || return 0
+    size=$(stat -f '%z' "$LOG_FILE" 2>/dev/null || true)
+    [[ "$size" =~ ^[0-9]+$ ]] || return 0
+    [ "$size" -lt "$max_bytes" ] && return 0
 
-validate_boolean_configs() {
-    local previous_value
-
-    previous_value="$ALLOW_AUTOMOUNT"
-    ALLOW_AUTOMOUNT=$(normalize_bool "$ALLOW_AUTOMOUNT" "false")
-    if ! is_valid_bool_literal "$previous_value"; then
-        log "WARNING: Invalid ALLOW_AUTOMOUNT value ($previous_value); using $ALLOW_AUTOMOUNT"
-    fi
-
-    previous_value="$EJECT_WHEN_NO_BACKUP"
-    EJECT_WHEN_NO_BACKUP=$(normalize_bool "$EJECT_WHEN_NO_BACKUP" "true")
-    if ! is_valid_bool_literal "$previous_value"; then
-        log "WARNING: Invalid EJECT_WHEN_NO_BACKUP value ($previous_value); using $EJECT_WHEN_NO_BACKUP"
-    fi
-
-    previous_value="$SHOW_MENUBAR_ICON_DURING_BACKUP"
-    SHOW_MENUBAR_ICON_DURING_BACKUP=$(normalize_bool "$SHOW_MENUBAR_ICON_DURING_BACKUP" "true")
-    if ! is_valid_bool_literal "$previous_value"; then
-        log "WARNING: Invalid SHOW_MENUBAR_ICON_DURING_BACKUP value ($previous_value); using $SHOW_MENUBAR_ICON_DURING_BACKUP"
-    fi
-
-    previous_value="$REQUIRE_SNAPSHOT_VERIFICATION"
-    REQUIRE_SNAPSHOT_VERIFICATION=$(normalize_bool "$REQUIRE_SNAPSHOT_VERIFICATION" "false")
-    if ! is_valid_bool_literal "$previous_value"; then
-        log "WARNING: Invalid REQUIRE_SNAPSHOT_VERIFICATION value ($previous_value); using $REQUIRE_SNAPSHOT_VERIFICATION"
-    fi
-}
-
-validate_destination_config() {
-    if [ -n "$PREFERRED_DESTINATION_ID" ] && ! [[ "$PREFERRED_DESTINATION_ID" =~ ^[0-9A-Fa-f-]+$ ]]; then
-        log "WARNING: PREFERRED_DESTINATION_ID does not look like a UUID: $PREFERRED_DESTINATION_ID"
-    fi
-}
-
-validate_menu_icon_config() {
-    local candidate
-    local found_path=""
-
-    if [[ "$SHOW_MENUBAR_ICON_DURING_BACKUP" != true ]]; then
-        return 0
-    fi
-
-    for candidate in "${TIME_MACHINE_MENU_CANDIDATES[@]}"; do
-        if [ -e "$candidate" ]; then
-            found_path="$candidate"
-            break
+    for ((idx=keep_count-1; idx>=1; idx--)); do
+        if [ -f "${LOG_FILE}.${idx}" ]; then
+            mv -f "${LOG_FILE}.${idx}" "${LOG_FILE}.$((idx + 1))" 2>/dev/null || true
         fi
     done
-
-    if [ -n "$found_path" ]; then
-        TIME_MACHINE_MENU_EXTRA="$found_path"
-        rm -f "$TM_MENU_PATH_NOTICE_FILE"
-        return 0
-    fi
-
-    if [ ! -e "$TIME_MACHINE_MENU_EXTRA" ]; then
-        SHOW_MENUBAR_ICON_DURING_BACKUP=false
-        if [ ! -f "$TM_MENU_PATH_NOTICE_FILE" ]; then
-            log "WARNING: Time Machine menu extra not found at expected path ($TIME_MACHINE_MENU_EXTRA); menu icon feature disabled"
-            printf '%s\n' "$(date +%s)" > "$TM_MENU_PATH_NOTICE_FILE"
-        fi
-    fi
-}
-
-# Log function
-log() {
-    printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+    mv -f "$LOG_FILE" "${LOG_FILE}.1" 2>/dev/null || true
 }
 
 escape_applescript_string() {
     local value="$1"
     value=${value//\\/\\\\}
     value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\t'/\\t}
     printf '%s' "$value"
 }
 
@@ -311,174 +129,99 @@ notify_user() {
     fi
 
     if ! osascript -e "$script" >/dev/null 2>&1; then
-        log "WARNING: Could not display notification: $title | $message"
-        return 1
+        log "WARNING: Failed to display notification: $message"
     fi
-    return 0
 }
 
-output_indicates_fda_issue() {
-    printf '%s\n' "$1" | grep -Eq 'Full Disk Access|Operation not permitted'
+validate_numeric_configs() {
+    if ! [[ "$BACKUP_POLL_SECONDS" =~ ^[0-9]+$ ]] || [ "$BACKUP_POLL_SECONDS" -lt 1 ]; then
+        log "WARNING: Invalid BACKUP_POLL_SECONDS ($BACKUP_POLL_SECONDS); using 15"
+        BACKUP_POLL_SECONDS=15
+    fi
+    if ! [[ "$BACKUP_MAX_WAIT_SECONDS" =~ ^[0-9]+$ ]] || [ "$BACKUP_MAX_WAIT_SECONDS" -lt "$BACKUP_POLL_SECONDS" ]; then
+        log "WARNING: Invalid BACKUP_MAX_WAIT_SECONDS ($BACKUP_MAX_WAIT_SECONDS); using 43200"
+        BACKUP_MAX_WAIT_SECONDS=43200
+    fi
+    if ! [[ "$POST_BACKUP_SETTLE_SECONDS" =~ ^[0-9]+$ ]] || [ "$POST_BACKUP_SETTLE_SECONDS" -lt 0 ]; then
+        log "WARNING: Invalid POST_BACKUP_SETTLE_SECONDS ($POST_BACKUP_SETTLE_SECONDS); using 10"
+        POST_BACKUP_SETTLE_SECONDS=10
+    fi
+    if ! [[ "$UNMOUNT_RETRY_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$UNMOUNT_RETRY_ATTEMPTS" -lt 1 ]; then
+        log "WARNING: Invalid UNMOUNT_RETRY_ATTEMPTS ($UNMOUNT_RETRY_ATTEMPTS); using 3"
+        UNMOUNT_RETRY_ATTEMPTS=3
+    fi
+    if ! [[ "$LOCK_STALE_SECONDS" =~ ^[0-9]+$ ]] || [ "$LOCK_STALE_SECONDS" -lt 60 ]; then
+        log "WARNING: Invalid LOCK_STALE_SECONDS ($LOCK_STALE_SECONDS); using 21600"
+        LOCK_STALE_SECONDS=21600
+    fi
+    if ! [[ "$LOCK_REFRESH_SECONDS" =~ ^[0-9]+$ ]] || [ "$LOCK_REFRESH_SECONDS" -lt 60 ]; then
+        log "WARNING: Invalid LOCK_REFRESH_SECONDS ($LOCK_REFRESH_SECONDS); using 600"
+        LOCK_REFRESH_SECONDS=600
+    fi
+
+    if [ "$BACKUP_POLL_SECONDS" -gt 300 ]; then
+        log "WARNING: BACKUP_POLL_SECONDS too large ($BACKUP_POLL_SECONDS); capping at 300"
+        BACKUP_POLL_SECONDS=300
+    fi
+    if [ "$BACKUP_MAX_WAIT_SECONDS" -gt 86400 ]; then
+        log "WARNING: BACKUP_MAX_WAIT_SECONDS too large ($BACKUP_MAX_WAIT_SECONDS); capping at 86400"
+        BACKUP_MAX_WAIT_SECONDS=86400
+    fi
+    if [ "$POST_BACKUP_SETTLE_SECONDS" -gt 300 ]; then
+        log "WARNING: POST_BACKUP_SETTLE_SECONDS too large ($POST_BACKUP_SETTLE_SECONDS); capping at 300"
+        POST_BACKUP_SETTLE_SECONDS=300
+    fi
+    if [ "$UNMOUNT_RETRY_ATTEMPTS" -gt 10 ]; then
+        log "WARNING: UNMOUNT_RETRY_ATTEMPTS too large ($UNMOUNT_RETRY_ATTEMPTS); capping at 10"
+        UNMOUNT_RETRY_ATTEMPTS=10
+    fi
+    if [ "$LOCK_STALE_SECONDS" -gt 604800 ]; then
+        log "WARNING: LOCK_STALE_SECONDS too large ($LOCK_STALE_SECONDS); capping at 604800"
+        LOCK_STALE_SECONDS=604800
+    fi
+    if [ "$LOCK_REFRESH_SECONDS" -gt "$LOCK_STALE_SECONDS" ]; then
+        log "WARNING: LOCK_REFRESH_SECONDS ($LOCK_REFRESH_SECONDS) exceeds LOCK_STALE_SECONDS ($LOCK_STALE_SECONDS); using 600"
+        LOCK_REFRESH_SECONDS=600
+    fi
 }
 
-rotate_log_file_if_needed() {
-    local size max_files i
-
-    if ! [[ "$MAX_LOG_BYTES" =~ ^[0-9]+$ ]] || [ "$MAX_LOG_BYTES" -le 0 ]; then
-        return 0
-    fi
-
-    if [ ! -f "$LOG_FILE" ]; then
-        return 0
-    fi
-
-    size=$(stat -f '%z' "$LOG_FILE" 2>/dev/null)
-    if ! [[ "$size" =~ ^[0-9]+$ ]] || [ "$size" -lt "$MAX_LOG_BYTES" ]; then
-        return 0
-    fi
-
-    max_files="$MAX_LOG_FILES"
-    if ! [[ "$max_files" =~ ^[0-9]+$ ]]; then
-        max_files=5
-    fi
-
-    if [ "$max_files" -le 0 ]; then
-        : > "$LOG_FILE" || return 1
-        return 0
-    fi
-
-    for ((i=max_files; i>=1; i--)); do
-        if [ ! -f "$LOG_FILE.$i" ]; then
-            continue
-        fi
-        if [ "$i" -eq "$max_files" ]; then
-            rm -f "$LOG_FILE.$i" || return 1
-        else
-            mv "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))" || return 1
-        fi
-    done
-
-    mv "$LOG_FILE" "$LOG_FILE.1" || return 1
-    return 0
+tmutil_permission_error() {
+    printf '%s\n' "$1" | grep -Eqi 'Full Disk Access|Operation not permitted|not authorized|not privileged|permission denied|authorization denied|access denied|insufficient permissions?'
 }
 
-read_menu_extras_lines() {
-    local raw_output
-    local line
-    local item
+verify_tmutil_access() {
+    local output=""
+    local status=0
 
-    raw_output=$(defaults read com.apple.systemuiserver menuExtras 2>/dev/null) || return 1
-
-    while IFS= read -r line; do
-        line="${line#"${line%%[![:space:]]*}"}"
-        if [[ "$line" != \"* ]]; then
-            continue
-        fi
-        item="${line#\"}"
-        item="${item%\",}"
-        item="${item%\"}"
-        printf '%s\n' "$item"
-    done <<< "$raw_output"
-}
-
-mark_tm_menu_icon_added() {
-    printf '%s\n' "added-by-script-epoch=$(date +%s)" > "$TM_MENU_STATE_FILE"
-}
-
-menu_extra_contains_time_machine() {
-    read_menu_extras_lines | grep -Fxq "$TIME_MACHINE_MENU_EXTRA"
-}
-
-remove_tm_menu_icon_if_present() {
-    local item
-    local current_items=()
-    local filtered_items=()
-
-    if ! menu_extra_contains_time_machine; then
-        return 0
-    fi
-
-    while IFS= read -r item; do
-        current_items+=("$item")
-    done < <(read_menu_extras_lines)
-
-    if [ "${#current_items[@]}" -eq 0 ]; then
-        log "Could not read current menu extras while removing Time Machine menu icon"
+    output=$(tmutil version 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        log "ERROR: tmutil command failed ($status): $output"
+        notify_user "Time Machine Auto-Backup needs Full Disk Access. Add Terminal/iTerm/your launcher in System Settings > Privacy & Security > Full Disk Access, then RESTART the app to apply changes." "Time Machine Auto-Backup" "Basso"
         return 1
     fi
 
-    for item in "${current_items[@]}"; do
-        if [ "$item" != "$TIME_MACHINE_MENU_EXTRA" ]; then
-            filtered_items+=("$item")
-        fi
-    done
-
-    if [ "${#filtered_items[@]}" -eq "${#current_items[@]}" ]; then
-        return 0
+    output=$(tmutil destinationinfo -X 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] && tmutil_permission_error "$output"; then
+        log "ERROR: Time Machine destination query blocked by Full Disk Access: $output"
+        notify_user "Time Machine Auto-Backup needs Full Disk Access. Add Terminal/iTerm/your launcher in System Settings > Privacy & Security > Full Disk Access, then RESTART the app to apply changes." "Time Machine Auto-Backup" "Basso"
+        return 1
     fi
 
-    if [ "${#filtered_items[@]}" -eq 0 ]; then
-        if ! defaults write com.apple.systemuiserver menuExtras -array >/dev/null 2>&1; then
-            log "Failed to write updated menu extras while removing Time Machine menu icon"
-            return 1
-        fi
-    else
-        if ! defaults write com.apple.systemuiserver menuExtras -array "${filtered_items[@]}" >/dev/null 2>&1; then
-            log "Failed to write updated menu extras while removing Time Machine menu icon"
-            return 1
-        fi
+    output=$(tmutil status -X 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ] && tmutil_permission_error "$output"; then
+        log "ERROR: Time Machine status query blocked by Full Disk Access: $output"
+        notify_user "Time Machine Auto-Backup needs Full Disk Access. Add Terminal/iTerm/your launcher in System Settings > Privacy & Security > Full Disk Access, then RESTART the app to apply changes." "Time Machine Auto-Backup" "Basso"
+        return 1
     fi
-    if ! killall SystemUIServer >/dev/null 2>&1; then
-        log "Could not restart SystemUIServer after menu extras update"
-    fi
+
     return 0
 }
 
-show_tm_menu_icon_for_backup() {
-    if [[ "$SHOW_MENUBAR_ICON_DURING_BACKUP" != true ]]; then
-        return 0
-    fi
-    if menu_extra_contains_time_machine; then
-        return 0
-    fi
-
-    if open -g "$TIME_MACHINE_MENU_EXTRA" >/dev/null 2>&1; then
-        sleep 1
-        if menu_extra_contains_time_machine; then
-            TM_MENU_ICON_ADDED_BY_SCRIPT=true
-            mark_tm_menu_icon_added
-            log "Enabled Time Machine menu icon for active backup run"
-        else
-            log "Attempted to enable Time Machine menu icon, but verification failed"
-        fi
-    else
-        log "Failed to launch Time Machine menu extra"
-    fi
-}
-
-restore_tm_menu_icon_if_needed() {
-    if [[ "$TM_MENU_ICON_ADDED_BY_SCRIPT" != true ]]; then
-        rm -f "$TM_MENU_STATE_FILE"
-        return 0
-    fi
-
-    if remove_tm_menu_icon_if_present; then
-        log "Restored Time Machine menu icon setting after backup run"
-    else
-        log "Could not restore Time Machine menu icon state; leaving current menu extras unchanged"
-    fi
-
-    TM_MENU_ICON_ADDED_BY_SCRIPT=false
-    rm -f "$TM_MENU_STATE_FILE"
-}
-
-recover_tm_menu_icon_state_if_needed() {
-    if [ ! -f "$TM_MENU_STATE_FILE" ]; then
-        return 0
-    fi
-
-    log "Found stale menu icon marker from an interrupted run; leaving menu extras unchanged to preserve user preference"
-    rm -f "$TM_MENU_STATE_FILE"
+normalize_uuid() {
+    printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
 diskutil_info_plist() {
@@ -495,35 +238,13 @@ mount_point_for_target() {
     local disk_info
     local mount_point
 
-    disk_info=$(diskutil_info_plist "$target")
-    if [ -z "$disk_info" ]; then
-        return 1
-    fi
+    disk_info=$(diskutil_info_plist "$target") || return 1
+    [ -n "$disk_info" ] || return 1
 
     mount_point=$(printf '%s' "$disk_info" | extract_plist_value MountPoint)
-    if [ -z "$mount_point" ]; then
-        return 1
-    fi
+    [ -n "$mount_point" ] || return 1
 
     printf '%s\n' "$mount_point"
-}
-
-device_identifier_for_target() {
-    local target="$1"
-    local disk_info
-    local device_id
-
-    disk_info=$(diskutil_info_plist "$target")
-    if [ -z "$disk_info" ]; then
-        return 1
-    fi
-
-    device_id=$(printf '%s' "$disk_info" | extract_plist_value DeviceIdentifier)
-    if [ -z "$device_id" ]; then
-        return 1
-    fi
-
-    printf '%s\n' "$device_id"
 }
 
 is_volume_mounted() {
@@ -537,38 +258,8 @@ is_volume_mounted() {
     return 0
 }
 
-normalize_uuid() {
-    printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
-}
-
-sanitize_filename_component() {
-    printf '%s' "$1" | tr -cd '[:alnum:]._-'
-}
-
-last_success_file_for_destination() {
-    local dest_id="$1"
-    local normalized
-    local safe_id
-
-    if [ -z "$dest_id" ]; then
-        printf '%s\n' "$LEGACY_LAST_SUCCESS_FILE"
-        return 0
-    fi
-
-    normalized=$(normalize_uuid "$dest_id")
-    safe_id=$(sanitize_filename_component "$normalized")
-    if [ -z "$safe_id" ]; then
-        printf '%s\n' "$LEGACY_LAST_SUCCESS_FILE"
-        return 0
-    fi
-
-    printf '%s/last-successful-backup.%s.epoch\n' "$STATE_DIR" "$safe_id"
-}
-
-initialize_destination_state_files() {
-    local destination_file
-    destination_file=$(last_success_file_for_destination "$1")
-    LAST_SUCCESS_FILE="$destination_file"
+read_destination_info() {
+    tmutil destinationinfo -X 2>/dev/null
 }
 
 append_destination_record() {
@@ -576,10 +267,6 @@ append_destination_record() {
     local name="$2"
     local kind="$3"
     local mount_point="$4"
-
-    if [ -z "$id" ] && [ -z "$name" ] && [ -z "$kind" ] && [ -z "$mount_point" ]; then
-        return 0
-    fi
 
     DEST_IDS+=("$id")
     DEST_NAMES+=("$name")
@@ -646,29 +333,14 @@ resolve_mounted_path_for_destination() {
     return 1
 }
 
-any_local_destination_mounted() {
-    local idx
-
-    for idx in "${!DEST_IDS[@]}"; do
-        if [ "${DEST_KINDS[$idx]}" != "Local" ]; then
-            continue
-        fi
-        if resolve_mounted_path_for_destination "$idx" >/dev/null 2>&1; then
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-read_destination_info() {
-    tmutil destinationinfo -X 2>/dev/null
-}
-
 find_destination_index() {
     local preferred_id="$1"
     local preferred_upper=""
     local idx
+    local local_count=0
+    local local_idx=""
+    local mounted_local_count=0
+    local mounted_local_idx=""
 
     if [ "${#DEST_IDS[@]}" -eq 0 ]; then
         return 1
@@ -678,6 +350,9 @@ find_destination_index() {
         preferred_upper=$(normalize_uuid "$preferred_id")
         for idx in "${!DEST_IDS[@]}"; do
             if [ "$(normalize_uuid "${DEST_IDS[$idx]}")" = "$preferred_upper" ]; then
+                if [ "${DEST_KINDS[$idx]}" != "Local" ]; then
+                    return 3
+                fi
                 printf '%s\n' "$idx"
                 return 0
             fi
@@ -686,73 +361,120 @@ find_destination_index() {
     fi
 
     for idx in "${!DEST_IDS[@]}"; do
-        if [ "${DEST_KINDS[$idx]}" = "Local" ] && resolve_mounted_path_for_destination "$idx" >/dev/null 2>&1; then
-            printf '%s\n' "$idx"
-            return 0
-        fi
-    done
-
-    for idx in "${!DEST_IDS[@]}"; do
-        if [ "${DEST_KINDS[$idx]}" = "Local" ]; then
-            printf '%s\n' "$idx"
-            return 0
-        fi
-    done
-
-    return 1
-}
-
-attempt_mount_destination() {
-    local dest_name="$1"
-    local dest_mount="$2"
-    local dest_id="$3"
-    local candidate
-    local device_id
-    local mounted_path
-    local candidates=()
-
-    if [ -n "$dest_mount" ]; then
-        candidates+=("$dest_mount")
-    fi
-    if [ -n "$dest_name" ]; then
-        candidates+=("$dest_name")
-    fi
-    if [ -n "$dest_id" ]; then
-        candidates+=("$dest_id")
-    fi
-
-    for candidate in "${candidates[@]}"; do
-        mounted_path=$(mount_point_for_target "$candidate" 2>/dev/null || true)
-        if [ -n "$mounted_path" ] && is_volume_mounted "$mounted_path"; then
-            printf '%s\n' "$mounted_path"
-            return 0
-        fi
-
-        device_id=$(device_identifier_for_target "$candidate" 2>/dev/null || true)
-        if [ -z "$device_id" ]; then
+        if [ "${DEST_KINDS[$idx]}" != "Local" ]; then
             continue
         fi
+        local_count=$((local_count + 1))
+        if [ -z "$local_idx" ]; then
+            local_idx="$idx"
+        fi
+        if resolve_mounted_path_for_destination "$idx" >/dev/null 2>&1; then
+            mounted_local_count=$((mounted_local_count + 1))
+            mounted_local_idx="$idx"
+        fi
+    done
 
-        diskutil mount "$device_id" >/dev/null 2>&1 || true
-        mounted_path=$(mount_point_for_target "$device_id" 2>/dev/null || true)
-        if [ -n "$mounted_path" ] && is_volume_mounted "$mounted_path"; then
-            printf '%s\n' "$mounted_path"
+    if [ "$local_count" -eq 0 ]; then
+        return 1
+    fi
+
+    if [ "$local_count" -eq 1 ]; then
+        printf '%s\n' "$local_idx"
+        return 0
+    fi
+
+    if [ "$mounted_local_count" -eq 1 ]; then
+        printf '%s\n' "$mounted_local_idx"
+        return 0
+    fi
+
+    return 2
+}
+
+backup_in_progress() {
+    local status_xml
+    local running
+
+    # Intentionally global status check for single-destination setups.
+    # Any running backup means "leave mounted for safety."
+    status_xml=$(tmutil status -X 2>/dev/null || true)
+    if [ -n "$status_xml" ]; then
+        running=$(printf '%s' "$status_xml" | plutil -extract Running raw -o - - 2>/dev/null || true)
+        case "$running" in
+            1|true|TRUE|yes|YES)
+                return 0
+                ;;
+            0|false|FALSE|no|NO)
+                return 1
+                ;;
+        esac
+    fi
+
+    tmutil status 2>/dev/null | grep -q "Running = 1;"
+}
+
+wait_for_backup_completion() {
+    local waited=0
+    local since_refresh=0
+
+    if ! backup_in_progress; then
+        return 0
+    fi
+
+    log "Backup running; waiting up to ${BACKUP_MAX_WAIT_SECONDS}s for completion"
+    while backup_in_progress; do
+        if [ "$waited" -ge "$BACKUP_MAX_WAIT_SECONDS" ]; then
+            log "Backup still running after ${waited}s; leaving disk mounted"
+            return 1
+        fi
+        sleep "$BACKUP_POLL_SECONDS"
+        waited=$((waited + BACKUP_POLL_SECONDS))
+        since_refresh=$((since_refresh + BACKUP_POLL_SECONDS))
+        if [ "$since_refresh" -ge "$LOCK_REFRESH_SECONDS" ]; then
+            write_lock_metadata
+            since_refresh=0
+        fi
+    done
+
+    log "Backup finished after ${waited}s"
+    return 0
+}
+
+attempt_unmount() {
+    local mount_path="$1"
+    local attempt
+
+    for ((attempt=1; attempt<=UNMOUNT_RETRY_ATTEMPTS; attempt++)); do
+        if backup_in_progress; then
+            log "Backup resumed during unmount attempts; leaving disk mounted"
+            return 2
+        fi
+
+        if ! is_volume_mounted "$mount_path"; then
             return 0
         fi
+
+        log "Unmount attempt $attempt/$UNMOUNT_RETRY_ATTEMPTS for $mount_path"
+        if diskutil unmount "$mount_path" >/dev/null 2>&1; then
+            sleep 1
+            if ! is_volume_mounted "$mount_path"; then
+                return 0
+            fi
+        fi
+        sleep 2
     done
 
     return 1
 }
 
-cleanup() {
-    restore_tm_menu_icon_if_needed
-    rm -f "$LOCK_PID_FILE" "$LOCK_CREATED_FILE" "$LOCK_CMD_FILE" "$LOCK_START_FILE" 2>/dev/null
-    rmdir "$LOCK_DIR" 2>/dev/null
+write_last_signature() {
+    local signature="$1"
+    printf 'signature=%s\nepoch=%s\n' "$signature" "$(date +%s)" > "$STATE_FILE"
 }
 
 safe_remove_lock_dir() {
     case "$LOCK_DIR" in
-        "$HOME/Library/Caches/com.user.timemachine-auto.lock"|"$HOME/Library/Caches/"*/com.user.timemachine-auto.lock)
+        "$HOME/Library/Caches/com.user.timemachine-auto-v3.lock")
             ;;
         *)
             log "Refusing unsafe lock cleanup path: $LOCK_DIR"
@@ -760,142 +482,86 @@ safe_remove_lock_dir() {
             ;;
     esac
 
+    if [ ! -d "$LOCK_DIR" ] || [ -L "$LOCK_DIR" ]; then
+        log "Refusing lock cleanup; path is missing or symlinked: $LOCK_DIR"
+        return 1
+    fi
+
     rm -rf "$LOCK_DIR" 2>/dev/null || return 1
     return 0
 }
 
-read_ps_command() {
-    ps -p "$1" -o command= 2>/dev/null | head -n 1
-}
-
-read_ps_start_key() {
-    ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}'
-}
-
 write_lock_metadata() {
-    local current_cmd current_start
     printf '%s\n' "$$" > "$LOCK_PID_FILE"
     printf '%s\n' "$(date +%s)" > "$LOCK_CREATED_FILE"
-
-    current_cmd=$(read_ps_command "$$")
-    if [ -n "$current_cmd" ]; then
-        printf '%s\n' "$current_cmd" > "$LOCK_CMD_FILE"
-    fi
-
-    current_start=$(read_ps_start_key "$$")
-    if [ -n "$current_start" ]; then
-        printf '%s\n' "$current_start" > "$LOCK_START_FILE"
-    fi
 }
 
-is_lock_owner_active() {
+lock_pid_looks_like_tm_script() {
     local pid="$1"
-    local stored_cmd="$2"
-    local stored_start="$3"
-    local current_cmd current_start
+    local cmdline
 
-    if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
-        return 1
-    fi
-    if ! kill -0 "$pid" 2>/dev/null; then
-        return 1
-    fi
+    cmdline=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    [ -n "$cmdline" ] || return 1
 
-    current_cmd=$(read_ps_command "$pid")
-    if [ -z "$current_cmd" ]; then
-        return 1
-    fi
-
-    if [ -n "$stored_start" ]; then
-        current_start=$(read_ps_start_key "$pid")
-        if [ -z "$current_start" ] || [ "$current_start" != "$stored_start" ]; then
-            return 1
-        fi
-    fi
-
-    if [[ "$current_cmd" == *"timemachine-auto.sh"* ]]; then
-        return 0
-    fi
-
-    if [ -n "$stored_cmd" ] && [ "$current_cmd" = "$stored_cmd" ]; then
-        return 0
-    fi
-
+    case "$cmdline" in
+        *timemachine-auto.sh*)
+            return 0
+            ;;
+    esac
     return 1
 }
 
 acquire_lock() {
+    local existing_pid=""
+    local created_epoch=""
+    local now_epoch
+    local lock_age=""
+
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         write_lock_metadata
         return 0
     fi
 
     if [ ! -d "$LOCK_DIR" ]; then
-        log "Lock directory could not be created and does not exist; exiting"
+        log "Lock directory create failed unexpectedly; exiting"
         return 1
     fi
 
-    local existing_pid
-    local created_epoch
-    local now_epoch
-    local lock_age
-    local existing_cmd
-    local existing_start
-    existing_pid=""
-    created_epoch=""
-    lock_age=""
-    existing_cmd=""
-    existing_start=""
     now_epoch=$(date +%s)
 
     if [ -f "$LOCK_PID_FILE" ]; then
-        existing_pid=$(cat "$LOCK_PID_FILE" 2>/dev/null)
+        existing_pid=$(tr -d '[:space:]' < "$LOCK_PID_FILE" 2>/dev/null)
     fi
 
-    if [ -f "$LOCK_CMD_FILE" ]; then
-        existing_cmd=$(cat "$LOCK_CMD_FILE" 2>/dev/null)
-    fi
-
-    if [ -f "$LOCK_START_FILE" ]; then
-        existing_start=$(cat "$LOCK_START_FILE" 2>/dev/null)
-    fi
-
-    if is_lock_owner_active "$existing_pid" "$existing_cmd" "$existing_start"; then
-        log "Another run is already in progress (pid: $existing_pid); exiting"
-        return 1
+    if [[ "$existing_pid" =~ ^[0-9]+$ ]] && kill -0 "$existing_pid" 2>/dev/null; then
+        if lock_pid_looks_like_tm_script "$existing_pid"; then
+            log "Another run is already in progress (pid: $existing_pid); exiting"
+            return 1
+        fi
+        log "Lock PID $existing_pid is alive but does not match script command; treating lock as stale"
     fi
 
     if [ -f "$LOCK_CREATED_FILE" ]; then
         created_epoch=$(tr -d '[:space:]' < "$LOCK_CREATED_FILE" 2>/dev/null)
-        if [[ "$created_epoch" =~ ^[0-9]+$ ]]; then
-            lock_age=$((now_epoch - created_epoch))
-        fi
-    elif created_epoch=$(stat -f '%m' "$LOCK_DIR" 2>/dev/null); then
-        if [[ "$created_epoch" =~ ^[0-9]+$ ]]; then
-            lock_age=$((now_epoch - created_epoch))
-        fi
+    else
+        created_epoch=$(stat -f '%m' "$LOCK_DIR" 2>/dev/null || true)
     fi
 
-    if [ -z "$existing_pid" ] || ! [[ "$existing_pid" =~ ^[0-9]+$ ]]; then
-        if [[ "$lock_age" =~ ^[0-9]+$ ]]; then
-            if [ "$lock_age" -lt "$MAX_LOCK_PID_WAIT_SECONDS" ]; then
-                log "Lock exists without a valid PID and is only ${lock_age}s old; assuming active setup race, exiting"
-                return 1
-            fi
-            if [ "$lock_age" -lt "$LOCK_STALE_SECONDS" ]; then
-                log "Lock exists without a valid PID for ${lock_age}s; reclaiming stale setup-race lock"
-            fi
+    if [[ "$created_epoch" =~ ^[0-9]+$ ]]; then
+        lock_age=$((now_epoch - created_epoch))
+        if [ -z "$existing_pid" ] && [ "$lock_age" -lt 60 ]; then
+            log "Lock exists without PID and is ${lock_age}s old; assuming setup race, exiting"
+            return 1
+        fi
+        if [ -z "$existing_pid" ] && [ "$lock_age" -ge 60 ]; then
+            log "Lock exists without PID and is ${lock_age}s old; treating as stale"
         fi
     fi
 
     log "Removing stale lock (pid: ${existing_pid:-missing}, age: ${lock_age:-unknown}s)"
-    rm -f "$LOCK_PID_FILE" "$LOCK_CREATED_FILE" "$LOCK_CMD_FILE" "$LOCK_START_FILE" 2>/dev/null
-    if ! rmdir "$LOCK_DIR" 2>/dev/null; then
-        log "Stale lock directory is not empty; attempting safe forced cleanup"
-        if ! safe_remove_lock_dir; then
-            log "Failed to remove stale lock directory safely; exiting"
-            return 1
-        fi
+    if ! safe_remove_lock_dir; then
+        log "Failed to remove stale lock directory; exiting"
+        return 1
     fi
 
     if mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -907,542 +573,209 @@ acquire_lock() {
     return 1
 }
 
-backup_in_progress() {
-    tmutil status 2>/dev/null | grep -q "Running = 1;"
-}
-
-wait_for_running_backup_to_finish() {
-    local waited=0
-
-    if ! backup_in_progress; then
-        return 0
-    fi
-
-    log "Detected already-running Time Machine backup; waiting up to ${WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS}s before eject decision"
-    while backup_in_progress; do
-        if [ "$waited" -ge "$WAIT_FOR_RUNNING_BACKUP_MAX_SECONDS" ]; then
-            log "Backup still running after ${waited}s; leaving disk mounted for safety"
-            return 1
-        fi
-        sleep "$RUNNING_BACKUP_POLL_SECONDS"
-        waited=$((waited + RUNNING_BACKUP_POLL_SECONDS))
-    done
-
-    log "Detected completion of already-running Time Machine backup after ${waited}s"
-    return 0
-}
-
-read_epoch_from_file() {
-    local state_path="$1"
-    local value
-    if [ ! -f "$state_path" ]; then
-        return 0
-    fi
-    value=$(tr -d '[:space:]' < "$state_path" 2>/dev/null)
-    if [[ "$value" =~ ^[0-9]+$ ]]; then
-        printf '%s\n' "$value"
-    fi
-}
-
-latest_snapshot_id_for_mount() {
-    local mount_path="$1"
-    local list_output
-    local latest_output
-    local snapshot_id
-
-    list_output=$(tmutil listbackups -d "$mount_path" 2>/dev/null || true)
-    snapshot_id=$(printf '%s\n' "$list_output" | grep -Eo '([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6})' | tail -n 1)
-
-    if [ -z "$snapshot_id" ]; then
-        latest_output=$(tmutil latestbackup -d "$mount_path" 2>/dev/null || true)
-        snapshot_id=$(printf '%s\n' "$latest_output" | grep -Eo '([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6})' | tail -n 1)
-    fi
-
-    printf '%s\n' "$snapshot_id"
-}
-
-handle_successful_backup_completion() {
-    local pre_backup_id="$1"
-    local post_backup_id=""
-
-    post_backup_id=$(latest_snapshot_id_for_mount "$TM_MOUNT")
-
-    if [[ "$REQUIRE_SNAPSHOT_VERIFICATION" == true ]]; then
-        if [ -z "$post_backup_id" ]; then
-            log "Backup completed but snapshot verification is required and no snapshot ID was readable; leaving disk mounted for re-check"
-            return 1
-        fi
-        if [ -n "$pre_backup_id" ] && [ "$post_backup_id" = "$pre_backup_id" ]; then
-            log "Backup completed but snapshot verification is required and no new snapshot was detected; leaving disk mounted for re-check"
-            return 1
-        fi
-    fi
-
-    write_epoch_to_file "$LAST_SUCCESS_FILE" "$(date +%s)"
-    if [ -n "$post_backup_id" ]; then
-        log "Backup completed successfully (latest snapshot: $post_backup_id)"
-    else
-        log "Backup completed successfully (snapshot ID unavailable; proceeding by tmutil success exit code)"
-    fi
-    notify_user "Backup completed successfully" "Time Machine Auto-Backup" || true
-    ALLOW_EJECT=true
-    return 0
-}
-
-run_tmutil_startbackup_with_timeout() {
-    local destination_id="$1"
-    local timeout_seconds="$2"
-    local poll_seconds=5
-    local waited=0
-    local start_status
-    local start_waited=0
-    local start_wait_limit=60
-
-    BACKUP_OUTPUT=$(tmutil startbackup --auto --destination "$destination_id" 2>&1)
-    start_status=$?
-    if [ "$start_status" -ne 0 ]; then
-        return "$start_status"
-    fi
-
-    # Allow a short window for backupd to flip into Running=1.
-    while [ "$start_waited" -lt "$start_wait_limit" ] && ! backup_in_progress; do
-        sleep 1
-        start_waited=$((start_waited + 1))
-    done
-
-    while backup_in_progress; do
-        if [ "$waited" -ge "$timeout_seconds" ]; then
-            return 124
-        fi
-        sleep "$poll_seconds"
-        waited=$((waited + poll_seconds))
-    done
-
-    return 0
-}
-
-write_epoch_to_file() {
-    local state_path="$1"
-    local epoch_value="$2"
-    printf '%s\n' "$epoch_value" > "$state_path"
-}
-
-notify_fda_once_per_window() {
-    local now_epoch last_notice age
-    now_epoch=$(date +%s)
-    last_notice=$(read_epoch_from_file "$FDA_NOTICE_FILE")
-    if [[ "$last_notice" =~ ^[0-9]+$ ]]; then
-        age=$((now_epoch - last_notice))
-        if [ "$age" -ge 0 ] && [ "$age" -lt "$FDA_NOTIFY_COOLDOWN_SECONDS" ]; then
-            return 1
-        fi
-    fi
-    notify_user "Time Machine Auto-Backup needs Full Disk Access. Grant access in System Settings > Privacy & Security > Full Disk Access." "Time Machine Auto-Backup" "Basso" || true
-    write_epoch_to_file "$FDA_NOTICE_FILE" "$now_epoch"
-    return 0
-}
-
-attempt_eject() {
-    local mount_path="$1"
-    local attempt
-    for ((attempt=1; attempt<=EJECT_RETRY_ATTEMPTS; attempt++)); do
-        if backup_in_progress; then
-            log "Backup is running during eject attempts; leaving disk mounted"
-            return 2
-        fi
-        if ! is_volume_mounted "$mount_path"; then
-            return 0
-        fi
-
-        log "Eject attempt $attempt/$EJECT_RETRY_ATTEMPTS for $mount_path"
-        diskutil unmount "$mount_path" >/dev/null 2>&1 || true
-        sleep 2
-        if diskutil eject "$mount_path" >/dev/null 2>&1; then
-            sleep 1
-            if ! is_volume_mounted "$mount_path"; then
-                return 0
-            fi
-        fi
-        sleep 3
-    done
-    return 1
-}
-
-read_last_signature() {
-    if [ ! -f "$STATE_FILE" ]; then
-        return 0
-    fi
-    grep '^signature=' "$STATE_FILE" 2>/dev/null | head -n 1 | cut -d'=' -f2-
-}
-
-read_last_epoch() {
-    if [ ! -f "$STATE_FILE" ]; then
-        return 0
-    fi
-    grep '^epoch=' "$STATE_FILE" 2>/dev/null | head -n 1 | cut -d'=' -f2-
-}
-
-write_last_signature() {
-    local signature="$1"
-    printf 'signature=%s\nepoch=%s\n' "$signature" "$(date +%s)" > "$STATE_FILE"
+cleanup() {
+    rm -f "$LOCK_PID_FILE" "$LOCK_CREATED_FILE" 2>/dev/null
+    rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
 validate_numeric_configs
-validate_boolean_configs
-validate_destination_config
-validate_menu_icon_config
+
+if ! command -v tmutil >/dev/null 2>&1 || ! command -v diskutil >/dev/null 2>&1 || ! command -v plutil >/dev/null 2>&1; then
+    log "Missing required command(s) tmutil/diskutil/plutil; exiting"
+    exit 1
+fi
+
+if ! verify_tmutil_access; then
+    exit 1
+fi
+
+if [ -n "$PREFERRED_DESTINATION_ID" ]; then
+    if ! [[ "$PREFERRED_DESTINATION_ID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+        log "ERROR: PREFERRED_DESTINATION_ID is not a valid UUID format: $PREFERRED_DESTINATION_ID"
+        log "Expected format: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX (hex digits)"
+        log "Run 'tmutil destinationinfo' to get valid destination IDs"
+        notify_user "Invalid PREFERRED_DESTINATION_ID format in script. Check logs for details." "Time Machine Auto-Backup" "Basso"
+        exit 1
+    fi
+fi
 
 if ! acquire_lock; then
     exit 0
 fi
 trap cleanup INT TERM EXIT
 
-if ! rotate_log_file_if_needed; then
-    log "WARNING: Log rotation failed; continuing without rotation"
-fi
-recover_tm_menu_icon_state_if_needed
-
-# Check if Time Machine destination is available
 DEST_INFO=$(read_destination_info)
-if [ $? -ne 0 ] || [ -z "$DEST_INFO" ]; then
-    log "No Time Machine destination found, exiting"
+if [ -z "$DEST_INFO" ]; then
+    log "No Time Machine destination info available; exiting"
     exit 0
 fi
 
 parse_destinations_from_info "$DEST_INFO"
 if [ "${#DEST_IDS[@]}" -eq 0 ]; then
-    log "No Time Machine destinations parsed from tmutil output, exiting"
-    exit 0
-fi
-
-# Fast path: StartOnMount fires for any filesystem mount. If this event does not
-# currently show a Time Machine mount point, exit quickly to avoid unnecessary
-# sleep and extra processing on unrelated system mounts.
-if [ "$ALLOW_AUTOMOUNT" != "true" ] && ! any_local_destination_mounted; then
-    fast_wait_elapsed=0
-    while [ "$fast_wait_elapsed" -lt "$FAST_PATH_WAIT_SECONDS" ] && ! any_local_destination_mounted; do
-        sleep 1
-        fast_wait_elapsed=$((fast_wait_elapsed + 1))
-        DEST_INFO=$(read_destination_info)
-        if [ $? -ne 0 ] || [ -z "$DEST_INFO" ]; then
-            log "No Time Machine destination found, exiting"
-            exit 0
-        fi
-        parse_destinations_from_info "$DEST_INFO"
-    done
-
-    if ! any_local_destination_mounted; then
-        sleep 1
-        DEST_INFO=$(read_destination_info)
-        if [ $? -eq 0 ] && [ -n "$DEST_INFO" ]; then
-            parse_destinations_from_info "$DEST_INFO"
-        fi
-    fi
-
-    if ! any_local_destination_mounted; then
-        exit 0
-    fi
-fi
-
-# Wait for disk to fully mount only when this event appears relevant to Time Machine.
-sleep 5
-
-# Refresh destination info after mount settle delay.
-DEST_INFO=$(read_destination_info)
-if [ $? -ne 0 ] || [ -z "$DEST_INFO" ]; then
-    log "No Time Machine destination found, exiting"
-    exit 0
-fi
-
-parse_destinations_from_info "$DEST_INFO"
-if [ "${#DEST_IDS[@]}" -eq 0 ]; then
-    log "No Time Machine destinations parsed from tmutil output, exiting"
-    exit 0
-fi
-
-LOCAL_DEST_COUNT=0
-for idx in "${!DEST_IDS[@]}"; do
-    if [ "${DEST_KINDS[$idx]}" = "Local" ]; then
-        LOCAL_DEST_COUNT=$((LOCAL_DEST_COUNT + 1))
-    fi
-done
-
-if [ "$LOCAL_DEST_COUNT" -gt 1 ] && [ -z "$PREFERRED_DESTINATION_ID" ]; then
-    log "Multiple local Time Machine destinations detected ($LOCAL_DEST_COUNT). Set PREFERRED_DESTINATION_ID to avoid wrong-disk actions"
-    notify_user "Multiple local Time Machine destinations detected. Edit ~/Library/Scripts/timemachine-auto.sh and set PREFERRED_DESTINATION_ID. You can find IDs with: tmutil destinationinfo -X" "Time Machine Auto-Backup" "Basso" || true
+    log "No destinations parsed from tmutil output; exiting"
     exit 0
 fi
 
 DEST_INDEX=""
 if [ -n "$PREFERRED_DESTINATION_ID" ]; then
-    DEST_INDEX=$(find_destination_index "$PREFERRED_DESTINATION_ID" 2>/dev/null || true)
-    if [ -z "$DEST_INDEX" ]; then
-        log "Preferred destination ID not found ($PREFERRED_DESTINATION_ID); exiting to avoid acting on the wrong disk"
+    DEST_INDEX=$(find_destination_index "$PREFERRED_DESTINATION_ID" 2>/dev/null)
+    DEST_STATUS=$?
+    if [ "$DEST_STATUS" -ne 0 ]; then
+        if [ "$DEST_STATUS" -eq 3 ]; then
+            log "Preferred destination is not Local (id: $PREFERRED_DESTINATION_ID); exiting"
+            notify_user "Preferred Time Machine destination is not a local disk. Update PREFERRED_DESTINATION_ID." "Time Machine Auto-Backup" "Basso"
+            exit 0
+        fi
+        log "Preferred destination ID not found ($PREFERRED_DESTINATION_ID); exiting"
         exit 0
     fi
 else
-    DEST_INDEX=$(find_destination_index "" 2>/dev/null || true)
-    if [ -z "$DEST_INDEX" ]; then
-        log "No suitable local destination found in tmutil output, exiting"
+    DEST_INDEX=$(find_destination_index "" 2>/dev/null)
+    DEST_STATUS=$?
+    if [ "$DEST_STATUS" -ne 0 ]; then
+        if [ "$DEST_STATUS" -eq 2 ]; then
+            log "Multiple local destinations detected and selection is ambiguous; set PREFERRED_DESTINATION_ID"
+            notify_user "Multiple local Time Machine destinations were detected. Set PREFERRED_DESTINATION_ID in the script." "Time Machine Auto-Backup" "Basso"
+            exit 0
+        fi
+        log "No suitable local destination found; exiting"
         exit 0
     fi
 fi
 
 SELECTED_DEST_ID="${DEST_IDS[$DEST_INDEX]}"
 SELECTED_DEST_NAME="${DEST_NAMES[$DEST_INDEX]}"
-SELECTED_DEST_KIND="${DEST_KINDS[$DEST_INDEX]}"
-SELECTED_DEST_MOUNT="${DEST_MOUNTS[$DEST_INDEX]}"
-TM_MOUNT=""
-
-if [ -z "$SELECTED_DEST_ID" ]; then
-    log "Selected destination has no ID; exiting to avoid unpinned backup/eject behavior"
-    exit 0
-fi
-
-initialize_destination_state_files "$SELECTED_DEST_ID"
-
 TM_MOUNT=$(resolve_mounted_path_for_destination "$DEST_INDEX" 2>/dev/null || true)
 
-if [ -z "$TM_MOUNT" ] && [ "$ALLOW_AUTOMOUNT" = "true" ]; then
-    TM_MOUNT=$(attempt_mount_destination "$SELECTED_DEST_NAME" "$SELECTED_DEST_MOUNT" "$SELECTED_DEST_ID" 2>/dev/null || true)
-    if [ -n "$TM_MOUNT" ]; then
-        sleep 3
-    fi
+if [ -z "$SELECTED_DEST_ID" ]; then
+    log "Selected destination has no ID; exiting"
+    exit 0
 fi
 
 if [ -z "$TM_MOUNT" ]; then
-    log "Time Machine destination not mounted or not connected (name: ${SELECTED_DEST_NAME:-unknown}, id: ${SELECTED_DEST_ID:-unknown}), exiting"
     exit 0
 fi
 
-# Ignore duplicate triggers for a short window.
-# StartOnMount fires for any mounted volume; this keeps unrelated mounts from
-# immediately retriggering backup/eject for a disk we've just handled.
+MOUNT_INFO=$(diskutil_info_plist "$TM_MOUNT" || true)
+MOUNT_READ_ONLY=""
+if [ -n "$MOUNT_INFO" ]; then
+    MOUNT_READ_ONLY=$(printf '%s' "$MOUNT_INFO" | extract_plist_value ReadOnly)
+fi
+
+if [ ! -r "$TM_MOUNT" ]; then
+    log "Mount point is not readable: $TM_MOUNT"
+    notify_user "Time Machine disk is mounted but not readable. Check disk access and permissions." "Time Machine Auto-Backup" "Basso"
+    exit 1
+fi
+
+case "$MOUNT_READ_ONLY" in
+    1|[1-9][0-9]*|true|TRUE|True|yes|YES|Yes)
+        log "Mount point is read-only: $TM_MOUNT"
+        notify_user "Time Machine disk is mounted read-only. Repair the disk before automatic backups." "Time Machine Auto-Backup" "Basso"
+        exit 1
+        ;;
+esac
+
 MOUNT_INODE=$(stat -f '%i' "$TM_MOUNT" 2>/dev/null)
 if ! [[ "$MOUNT_INODE" =~ ^[0-9]+$ ]]; then
     MOUNT_INODE="ino-fallback-$(date +%s)-$$-$RANDOM"
-    log "Could not determine mount inode for $TM_MOUNT; using fallback signature component"
 fi
-CURRENT_SIGNATURE="${SELECTED_DEST_ID:-unknown}|${TM_MOUNT}|${MOUNT_INODE:-unknown}"
-LAST_SIGNATURE=$(read_last_signature)
-LAST_EPOCH=$(read_last_epoch)
-NOW_EPOCH=$(date +%s)
-LAST_AGE="$DUPLICATE_WINDOW_SECONDS"
-if [[ "$LAST_EPOCH" =~ ^[0-9]+$ ]]; then
-    LAST_AGE=$((NOW_EPOCH - LAST_EPOCH))
+# Include inode so unplug/replug is treated as a new mount session.
+CURRENT_SIGNATURE="${SELECTED_DEST_ID}|${TM_MOUNT}|${MOUNT_INODE}"
+
+log "Destination mounted (name: ${SELECTED_DEST_NAME:-unknown}, id: $SELECTED_DEST_ID) at $TM_MOUNT"
+
+START_OUTPUT=""
+START_STATUS=0
+BACKUP_COMPLETED=false
+
+if backup_in_progress; then
+    log "Backup already running before auto trigger; waiting for completion"
+    if ! wait_for_backup_completion; then
+        notify_user "Backup is taking unusually long. Disk was left mounted for safety." "Time Machine Auto-Backup" "Basso"
+        exit 1
+    fi
+    BACKUP_COMPLETED=true
+else
+    START_OUTPUT=$(tmutil startbackup --auto --block --destination "$SELECTED_DEST_ID" 2>&1)
+    START_STATUS=$?
+
+    if [ "$START_STATUS" -eq 0 ]; then
+        log "tmutil auto decision completed"
+    else
+        if printf '%s\n' "$START_OUTPUT" | grep -Eqi 'already running|Backup session is already running'; then
+            log "tmutil reported an already-running backup; waiting for completion"
+            if ! wait_for_backup_completion; then
+                notify_user "Backup is taking unusually long. Disk was left mounted for safety." "Time Machine Auto-Backup" "Basso"
+                exit 1
+            fi
+            BACKUP_COMPLETED=true
+        elif tmutil_permission_error "$START_OUTPUT"; then
+            log "ERROR: Time Machine command blocked by Full Disk Access; leaving disk mounted"
+            notify_user "Time Machine Auto-Backup needs Full Disk Access to run in this context." "Time Machine Auto-Backup" "Basso"
+            exit 1
+        else
+            log "WARNING: tmutil startbackup --auto --block returned $START_STATUS; output: $START_OUTPUT"
+        fi
+    fi
 fi
-if [ -n "$LAST_SIGNATURE" ] && [ "$LAST_SIGNATURE" = "$CURRENT_SIGNATURE" ] \
-    && [ "$LAST_AGE" -ge 0 ] && [ "$LAST_AGE" -lt "$DUPLICATE_WINDOW_SECONDS" ]; then
-    log "Mount session recently handled ($TM_MOUNT); exiting duplicate trigger"
+
+# Final safety check in case backup started/resumed right around tmutil return.
+# Safety check: In rare cases, --auto may start a backup that begins
+# just after --block returns. Check one more time before unmounting.
+if backup_in_progress; then
+    log "Backup running after auto decision; waiting for completion"
+    if ! wait_for_backup_completion; then
+        notify_user "Backup is taking unusually long. Disk was left mounted for safety." "Time Machine Auto-Backup" "Basso"
+        exit 1
+    fi
+    BACKUP_COMPLETED=true
+fi
+
+if [ "$BACKUP_COMPLETED" = "true" ]; then
+    if [ "$POST_BACKUP_SETTLE_SECONDS" -gt 0 ]; then
+        log "Backup path completed; settling for ${POST_BACKUP_SETTLE_SECONDS}s before unmount"
+        sleep "$POST_BACKUP_SETTLE_SECONDS"
+        if backup_in_progress; then
+            log "Backup resumed during settle delay; leaving disk mounted"
+            exit 0
+        fi
+    fi
+    log "Backup completed; proceeding to unmount"
+else
+    log "No backup active after auto decision; proceeding to unmount"
+fi
+
+CURRENT_MOUNT=$(resolve_mounted_path_for_destination "$DEST_INDEX" 2>/dev/null || true)
+if [ -n "$CURRENT_MOUNT" ] && [ "$CURRENT_MOUNT" != "$TM_MOUNT" ]; then
+    log "Mount point changed from $TM_MOUNT to $CURRENT_MOUNT; skipping unmount for safety"
     exit 0
 fi
 
-log "Time Machine destination ready (name: ${SELECTED_DEST_NAME:-unknown}, id: ${SELECTED_DEST_ID:-unknown}) mounted at: $TM_MOUNT"
-
-if backup_in_progress; then
-    if ! wait_for_running_backup_to_finish; then
-        log "Will retry while destination remains mounted (backup still in progress)"
-        exit 0
-    fi
-    log "A previously running backup completed; continuing with destination-specific backup need evaluation"
-fi
-
-# Get backup history from the selected Time Machine destination if available.
-LIST_OUTPUT=$(tmutil listbackups -d "$TM_MOUNT" 2>&1)
-LIST_STATUS=$?
-BACKUP_HISTORY_AVAILABLE=true
-if [ "$LIST_STATUS" -ne 0 ]; then
-    BACKUP_HISTORY_AVAILABLE=false
-    if output_indicates_fda_issue "$LIST_OUTPUT"; then
-        log "WARNING: Full Disk Access missing for this launchd context (tmutil listbackups blocked); using fallback schedule state"
-        notify_fda_once_per_window || true
-        if ! tmutil status >/dev/null 2>&1; then
-            log "CRITICAL: Time Machine operations are blocked in this context; cannot proceed without Full Disk Access"
-            notify_user "Time Machine Auto-Backup cannot run without Full Disk Access. Grant access in System Settings > Privacy & Security > Full Disk Access." "Time Machine Auto-Backup" "Basso" || true
-            exit 1
-        fi
-    else
-        log "WARNING: tmutil listbackups failed with exit code $LIST_STATUS; using fallback schedule state"
-    fi
-fi
-
-LAST_BACKUP=""
-if [ "$BACKUP_HISTORY_AVAILABLE" = "true" ]; then
-    LAST_BACKUP=$(printf '%s\n' "$LIST_OUTPUT" | grep -Eo '([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6})' | tail -n 1)
-    if [ -z "$LAST_BACKUP" ]; then
-        LATEST_OUTPUT=$(tmutil latestbackup -d "$TM_MOUNT" 2>/dev/null || true)
-        LAST_BACKUP=$(printf '%s\n' "$LATEST_OUTPUT" | grep -Eo '([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6})' | tail -n 1)
-    fi
-fi
-NEEDS_BACKUP=false
-ALLOW_EJECT=false
-THRESHOLD_SECONDS=$((BACKUP_THRESHOLD_HOURS * 60 * 60))
-MAX_FALLBACK_STATE_AGE_SECONDS=$((MAX_FALLBACK_STATE_AGE_HOURS * 60 * 60))
-
-# Determine if backup is needed
-if [ "$BACKUP_HISTORY_AVAILABLE" = "false" ]; then
-    LAST_SUCCESS_EPOCH=$(read_epoch_from_file "$LAST_SUCCESS_FILE")
-    if [[ "$LAST_SUCCESS_EPOCH" =~ ^[0-9]+$ ]]; then
-        CURRENT_TIME=$(date +%s)
-        SECONDS_SINCE=$((CURRENT_TIME - LAST_SUCCESS_EPOCH))
-        HOURS_SINCE=$((SECONDS_SINCE / 3600))
-        log "Fallback state: last successful backup run was $HOURS_SINCE hours ago"
-        if [ "$SECONDS_SINCE" -lt 0 ]; then
-            NEEDS_BACKUP=true
-        elif [ "$SECONDS_SINCE" -ge "$MAX_FALLBACK_STATE_AGE_SECONDS" ]; then
-            log "Fallback state is older than $MAX_FALLBACK_STATE_AGE_HOURS hours; forcing backup attempt"
-            NEEDS_BACKUP=true
-        elif [ "$SECONDS_SINCE" -ge "$THRESHOLD_SECONDS" ]; then
-            NEEDS_BACKUP=true
-        else
-            NEEDS_BACKUP=false
-        fi
-    else
-        log "Fallback state has no prior successful backup timestamp. Starting backup..."
-        NEEDS_BACKUP=true
-    fi
-elif [ -z "$LAST_BACKUP" ]; then
-    log "No previous backup found. Starting backup..."
-    NEEDS_BACKUP=true
-else
-    # Extract date from backup name (format: YYYY-MM-DD-HHMMSS)
-    if [[ "$LAST_BACKUP" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{6}) ]]; then
-        YEAR="${BASH_REMATCH[1]}"
-        MONTH="${BASH_REMATCH[2]}"
-        DAY="${BASH_REMATCH[3]}"
-        TIME="${BASH_REMATCH[4]}"
-
-        HOUR="${TIME:0:2}"
-        MINUTE="${TIME:2:2}"
-        SECOND="${TIME:4:2}"
-
-        BACKUP_DATE="$YEAR-$MONTH-$DAY $HOUR:$MINUTE:$SECOND"
-
-        # Convert local backup timestamp to epoch.
-        # Around DST shifts, local-time conversion can differ by about one hour.
-        LAST_BACKUP_TIMESTAMP=$(date -j -f "%Y-%m-%d %H:%M:%S" "$BACKUP_DATE" "+%s" 2>/dev/null)
-
-        if [[ "$LAST_BACKUP_TIMESTAMP" =~ ^[0-9]+$ ]]; then
-            CURRENT_TIME=$(date +%s)
-            SECONDS_SINCE=$((CURRENT_TIME - LAST_BACKUP_TIMESTAMP))
-            HOURS_SINCE=$((SECONDS_SINCE / 3600))
-            write_epoch_to_file "$LAST_SUCCESS_FILE" "$LAST_BACKUP_TIMESTAMP"
-            log "Last backup: $BACKUP_DATE ($HOURS_SINCE hours ago)"
-
-            if [ "$SECONDS_SINCE" -lt 0 ]; then
-                log "Detected backup timestamp in the future; forcing backup check"
-                NEEDS_BACKUP=true
-            elif [ "$SECONDS_SINCE" -ge "$MAX_FALLBACK_STATE_AGE_SECONDS" ]; then
-                log "Last backup age exceeded $MAX_FALLBACK_STATE_AGE_HOURS hours; forcing backup attempt"
-                NEEDS_BACKUP=true
-            elif [ "$SECONDS_SINCE" -ge "$THRESHOLD_SECONDS" ]; then
-                NEEDS_BACKUP=true
-            else
-                NEEDS_BACKUP=false
-            fi
-        else
-            log "Could not parse timestamp. Starting backup to be safe..."
-            NEEDS_BACKUP=true
-        fi
-    else
-        log "Could not parse backup date. Starting backup to be safe..."
-        NEEDS_BACKUP=true
-    fi
-fi
-
-# Perform backup if needed
-if [[ "$NEEDS_BACKUP" == true ]]; then
-    BACKUP_OUTPUT=""
-    PRE_BACKUP_ID="$LAST_BACKUP"
-    log "Starting Time Machine backup..."
-    show_tm_menu_icon_for_backup
-
-    run_tmutil_startbackup_with_timeout "$SELECTED_DEST_ID" "$BACKUP_BLOCK_TIMEOUT_SECONDS"
-    BACKUP_RESULT=$?
-
-    if [ "$BACKUP_RESULT" -eq 124 ]; then
-        log "Backup is still running or unresolved after ${BACKUP_BLOCK_TIMEOUT_SECONDS}s. Keeping disk mounted for safety."
-        notify_user "Backup is still running after $BACKUP_BLOCK_TIMEOUT_SECONDS seconds. Disk was left mounted." "Time Machine Auto-Backup" "Basso" || true
-        exit 1
-    elif [[ $BACKUP_RESULT -eq 0 ]]; then
-        if ! handle_successful_backup_completion "$PRE_BACKUP_ID"; then
-            exit 0
-        fi
-    else
-        if printf '%s\n' "$BACKUP_OUTPUT" | grep -Eqi 'already running|Backup session is already running' || backup_in_progress; then
-            log "tmutil reported an already-running backup while starting. Waiting for completion before eject decision."
-            if ! wait_for_running_backup_to_finish; then
-                log "Will retry while destination remains mounted (backup still in progress)"
-                exit 0
-            fi
-            log "Retrying destination-specific backup now that the running session has finished"
-            run_tmutil_startbackup_with_timeout "$SELECTED_DEST_ID" "$BACKUP_BLOCK_TIMEOUT_SECONDS"
-            BACKUP_RESULT=$?
-
-            if [ "$BACKUP_RESULT" -eq 124 ]; then
-                log "Retry backup timed out after ${BACKUP_BLOCK_TIMEOUT_SECONDS}s. Keeping disk mounted for safety."
-                notify_user "Backup retry timed out after $BACKUP_BLOCK_TIMEOUT_SECONDS seconds. Disk was left mounted." "Time Machine Auto-Backup" "Basso" || true
-                exit 1
-            elif [ "$BACKUP_RESULT" -eq 0 ]; then
-                if ! handle_successful_backup_completion "$PRE_BACKUP_ID"; then
-                    exit 0
-                fi
-            else
-                log "Backup retry failed with exit code: $BACKUP_RESULT. Keeping disk mounted for safety."
-                notify_user "Backup retry failed (exit code: $BACKUP_RESULT). Disk was left mounted." "Time Machine Auto-Backup" "Basso" || true
-                exit 1
-            fi
-        else
-            if output_indicates_fda_issue "$BACKUP_OUTPUT"; then
-                log "CRITICAL: Time Machine backup command was blocked by Full Disk Access restrictions"
-                notify_fda_once_per_window || true
-            fi
-            log "Backup failed with exit code: $BACKUP_RESULT. Keeping disk mounted for safety."
-            notify_user "Backup failed (exit code: $BACKUP_RESULT). Disk was left mounted." "Time Machine Auto-Backup" "Basso" || true
-            exit 1
-        fi
-    fi
-else
-    log "Backup not needed (threshold: $BACKUP_THRESHOLD_HOURS hours)"
-    if [[ "$EJECT_WHEN_NO_BACKUP" == true ]]; then
-        ALLOW_EJECT=true
-    else
-        log "Leaving disk mounted because EJECT_WHEN_NO_BACKUP=false"
-        ALLOW_EJECT=false
-    fi
-fi
-
-if [[ "$ALLOW_EJECT" == true ]]; then
-    # Wait before ejecting
-    sleep "$EJECT_PRECHECK_DELAY_SECONDS"
-
-    if backup_in_progress; then
-        log "Backup is running at eject check; leaving disk mounted"
-        exit 0
-    fi
-
-    if ! is_volume_mounted "$TM_MOUNT"; then
-        log "Disk already unmounted before eject step"
-        write_last_signature "$CURRENT_SIGNATURE"
-        exit 0
-    fi
-
-    # Eject the disk with retries
-    log "Ejecting $TM_MOUNT..."
-    attempt_eject "$TM_MOUNT"
-    EJECT_RESULT=$?
-    if [ "$EJECT_RESULT" -eq 0 ]; then
-        log "Disk ejected successfully"
-        write_last_signature "$CURRENT_SIGNATURE"
-    elif [ "$EJECT_RESULT" -eq 2 ]; then
-        log "Backup resumed during eject attempts; leaving disk mounted"
-        exit 0
-    else
-        log "Failed to eject disk after $EJECT_RETRY_ATTEMPTS attempts (may still be in use)"
-        rm -f "$STATE_FILE"
-        notify_user "Time Machine disk could not be ejected and will be retried on the next run." "Time Machine Auto-Backup" "Basso" || true
-        exit 1
-    fi
-else
+if ! is_volume_mounted "$TM_MOUNT"; then
+    log "Disk already unmounted before unmount step"
     write_last_signature "$CURRENT_SIGNATURE"
+    exit 0
 fi
+
+attempt_unmount "$TM_MOUNT"
+UNMOUNT_RESULT=$?
+
+if [ "$UNMOUNT_RESULT" -eq 0 ]; then
+    log "Disk unmounted successfully"
+    if backup_in_progress; then
+        log "WARNING: Backup reported running immediately after unmount"
+    fi
+    write_last_signature "$CURRENT_SIGNATURE"
+    exit 0
+fi
+
+if [ "$UNMOUNT_RESULT" -eq 2 ]; then
+    log "Backup resumed during unmount attempts; leaving disk mounted"
+    exit 0
+fi
+
+log "Failed to unmount disk after $UNMOUNT_RETRY_ATTEMPTS attempts"
+write_last_signature "$CURRENT_SIGNATURE"
+notify_user "Time Machine disk could not be unmounted and will be retried on next run." "Time Machine Auto-Backup" "Basso"
+exit 1
