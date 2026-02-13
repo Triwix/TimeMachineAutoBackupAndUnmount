@@ -41,7 +41,7 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.user.timemach
 <details>
 
 <summary>Option B: Terminal</summary>
-Important: run these commands from the directory that contains this README, `timemachine-auto.sh`, and `com.user.timemachine-auto.plist`.
+- Important: run these commands from the directory that contains this README, `timemachine-auto.sh`, and `com.user.timemachine-auto.plist`.
 
 ```bash
 # Go to folder with script + plist
